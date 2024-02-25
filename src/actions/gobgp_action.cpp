@@ -1,188 +1,12 @@
 #include "gobgp_action.hpp"
 #include "../fastnetmon_actions.hpp"
-#include "../fastnetmon_types.hpp"
 
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif // __GNUC__
-
-#include <grpc++/channel.h>
-#include <grpc++/client_context.h>
 #include <grpc++/create_channel.h>
 #include <grpc++/security/credentials.h>
-#include <grpc/grpc.h>
-
-#include "attribute.pb.h"
-#include "gobgp.grpc.pb.h"
 
 #include "../bgp_protocol.hpp"
 
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif // __GNUC__
-
-
-unsigned int gobgp_client_connection_timeout = 5;
-
-using grpc::Channel;
-using grpc::ClientContext;
-using grpc::Status;
-
-using gobgpapi::GobgpApi;
-
-class GrpcClient {
-    public:
-    GrpcClient(std::shared_ptr<Channel> channel) : stub_(GobgpApi::NewStub(channel)) {
-    }
-
-    bool AnnounceUnicastPrefixIPv4(std::string announced_address,
-                                   std::string announced_prefix_nexthop,
-                                   bool is_withdrawal,
-                                   unsigned int cidr_mask,
-                                   uint32_t community_as_32bit_int) {
-        grpc::ClientContext context;
-
-        // Set timeout for API
-        std::chrono::system_clock::time_point deadline =
-            std::chrono::system_clock::now() + std::chrono::seconds(gobgp_client_connection_timeout);
-        context.set_deadline(deadline);
-
-        auto gobgp_ipv4_unicast_route_family = new gobgpapi::Family;
-        gobgp_ipv4_unicast_route_family->set_afi(gobgpapi::Family::AFI_IP);
-        gobgp_ipv4_unicast_route_family->set_safi(gobgpapi::Family::SAFI_UNICAST);
-
-        gobgpapi::AddPathRequest request;
-        request.set_table_type(gobgpapi::TableType::GLOBAL);
-
-        gobgpapi::Path* current_path = new gobgpapi::Path;
-
-        current_path->set_allocated_family(gobgp_ipv4_unicast_route_family);
-
-        if (is_withdrawal) {
-            current_path->set_is_withdraw(true);
-        }
-
-        // Configure required announce
-        google::protobuf::Any* current_nlri = new google::protobuf::Any;
-        gobgpapi::IPAddressPrefix current_ipaddrprefix;
-        current_ipaddrprefix.set_prefix(announced_address);
-        current_ipaddrprefix.set_prefix_len(cidr_mask);
-
-        current_nlri->PackFrom(current_ipaddrprefix);
-        current_path->set_allocated_nlri(current_nlri);
-
-        // Updating OriginAttribute info for current_path
-        google::protobuf::Any* current_origin = current_path->add_pattrs();
-        gobgpapi::OriginAttribute current_origin_t;
-        current_origin_t.set_origin(0);
-        current_origin->PackFrom(current_origin_t);
-
-        // Updating NextHopAttribute info for current_path
-        google::protobuf::Any* current_next_hop = current_path->add_pattrs();
-        gobgpapi::NextHopAttribute current_next_hop_t;
-        current_next_hop_t.set_next_hop(announced_prefix_nexthop);
-        current_next_hop->PackFrom(current_next_hop_t);
-
-        // Updating CommunitiesAttribute for current_path
-        google::protobuf::Any* current_communities = current_path->add_pattrs();
-        gobgpapi::CommunitiesAttribute current_communities_t;
-        current_communities_t.add_communities(community_as_32bit_int);
-        current_communities->PackFrom(current_communities_t);
-
-        request.set_allocated_path(current_path);
-
-        gobgpapi::AddPathResponse response;
-
-        // Don't be confused by name, it also can withdraw announces
-        auto status = stub_->AddPath(&context, request, &response);
-
-        if (!status.ok()) {
-            logger << log4cpp::Priority::ERROR << "AddPath request to BGP daemon failed with code: " << status.error_code()
-                   << " message " << status.error_message();
-
-            return false;
-        }
-
-
-        return true;
-    }
-
-    bool AnnounceUnicastPrefixIPv6(const subnet_ipv6_cidr_mask_t& client_ipv6,
-                                   const subnet_ipv6_cidr_mask_t& ipv6_next_hop,
-                                   bool is_withdrawal,
-                                   uint32_t community_as_32bit_int) {
-        grpc::ClientContext context;
-
-        // Set timeout for API
-        std::chrono::system_clock::time_point deadline =
-            std::chrono::system_clock::now() + std::chrono::seconds(gobgp_client_connection_timeout);
-        context.set_deadline(deadline);
-
-        auto gobgp_ipv6_unicast_route_family = new gobgpapi::Family;
-        gobgp_ipv6_unicast_route_family->set_afi(gobgpapi::Family::AFI_IP6);
-        gobgp_ipv6_unicast_route_family->set_safi(gobgpapi::Family::SAFI_UNICAST);
-
-        gobgpapi::AddPathRequest request;
-        request.set_table_type(gobgpapi::TableType::GLOBAL);
-
-        gobgpapi::Path* current_path = new gobgpapi::Path;
-
-        current_path->set_allocated_family(gobgp_ipv6_unicast_route_family);
-
-        if (is_withdrawal) {
-            current_path->set_is_withdraw(true);
-        }
-
-        // Configure required announce
-        google::protobuf::Any* current_nlri = new google::protobuf::Any;
-        gobgpapi::IPAddressPrefix current_ipaddrprefix;
-        current_ipaddrprefix.set_prefix(print_ipv6_address(client_ipv6.subnet_address));
-        current_ipaddrprefix.set_prefix_len(client_ipv6.cidr_prefix_length);
-
-        current_nlri->PackFrom(current_ipaddrprefix);
-        current_path->set_allocated_nlri(current_nlri);
-
-        // Updating OriginAttribute info for current_path
-        google::protobuf::Any* current_origin = current_path->add_pattrs();
-        gobgpapi::OriginAttribute current_origin_t;
-        current_origin_t.set_origin(0);
-        current_origin->PackFrom(current_origin_t);
-
-        // Updating NextHopAttribute info for current_path
-        google::protobuf::Any* current_next_hop = current_path->add_pattrs();
-        gobgpapi::NextHopAttribute current_next_hop_t;
-        current_next_hop_t.set_next_hop(print_ipv6_address(ipv6_next_hop.subnet_address));
-        current_next_hop->PackFrom(current_next_hop_t);
-
-        // Updating CommunitiesAttribute for current_path
-        google::protobuf::Any* current_communities = current_path->add_pattrs();
-        gobgpapi::CommunitiesAttribute current_communities_t;
-        current_communities_t.add_communities(community_as_32bit_int);
-        current_communities->PackFrom(current_communities_t);
-
-        request.set_allocated_path(current_path);
-
-        gobgpapi::AddPathResponse response;
-
-        // Don't be confused by name, it also can withdraw announces
-        auto status = stub_->AddPath(&context, request, &response);
-
-        if (!status.ok()) {
-            logger << log4cpp::Priority::ERROR << "AddPath request to BGP daemon failed with code: " << status.error_code()
-                   << " message " << status.error_message();
-
-            return false;
-        }
-
-
-        return true;
-    }
-
-
-    private:
-    std::unique_ptr<GobgpApi::Stub> stub_;
-};
+#include "../gobgp_client/gobgp_client.hpp"
 
 GrpcClient* gobgp_client         = NULL;
 std::string gobgp_nexthop        = "0.0.0.0";
@@ -305,7 +129,7 @@ void gobgp_action_shutdown() {
     delete gobgp_client;
 }
 
-void gobgp_ban_manage(std::string action, bool ipv6, std::string ip_as_string, subnet_ipv6_cidr_mask_t client_ipv6, attack_details_t current_attack) {
+void gobgp_ban_manage(const std::string& action, bool ipv6, const std::string& ip_as_string, const subnet_ipv6_cidr_mask_t& client_ipv6, const subnet_cidr_mask_t& customer_network) {
     bool is_withdrawal = false;
 
     std::string action_name;
@@ -332,17 +156,17 @@ void gobgp_ban_manage(std::string action, bool ipv6, std::string ip_as_string, s
         }
     } else {
         if (gobgp_announce_whole_subnet) {
-            std::string subnet_as_string_with_mask = convert_subnet_to_string(current_attack.customer_network);
+            std::string subnet_as_string_with_mask = convert_subnet_to_string(customer_network);
             logger << log4cpp::Priority::INFO << action_name << " "
-                   << convert_subnet_to_string(current_attack.customer_network) << " to GoBGP";
+                   << convert_subnet_to_string(customer_network) << " to GoBGP";
 
             // https://github.com/osrg/gobgp/blob/0aff30a74216f499b8abfabc50016b041b319749/internal/pkg/table/policy_test.go#L2870
             uint32_t community_as_32bit_int =
                 uint32_t(bgp_community_subnet.asn_number << 16 | bgp_community_subnet.community_number);
 
-            gobgp_client->AnnounceUnicastPrefixIPv4(convert_ip_as_uint_to_string(current_attack.customer_network.subnet_address),
+            gobgp_client->AnnounceUnicastPrefixIPv4(convert_ip_as_uint_to_string(customer_network.subnet_address),
                                                     gobgp_nexthop, is_withdrawal,
-                                                    current_attack.customer_network.cidr_prefix_length, community_as_32bit_int);
+                                                    customer_network.cidr_prefix_length, community_as_32bit_int);
         }
 
         if (gobgp_announce_host) {

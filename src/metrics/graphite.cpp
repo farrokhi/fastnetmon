@@ -11,8 +11,6 @@
 #include "../abstract_subnet_counters.hpp"
 
 extern log4cpp::Category& logger;
-extern map_of_vector_counters_t SubnetVectorMapSpeed;
-extern map_of_vector_counters_t SubnetVectorMapSpeedAverage;
 extern uint64_t incoming_total_flows_speed;
 extern uint64_t outgoing_total_flows_speed;
 extern abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_counters;
@@ -27,95 +25,88 @@ extern unsigned int graphite_push_period;
 
 // Push host traffic to Graphite
 bool push_hosts_traffic_counters_to_graphite() {
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+
     std::vector<direction_t> processed_directions = { INCOMING, OUTGOING };
 
     graphite_data_t graphite_data;
 
-    map_of_vector_counters_t* current_speed_map = &SubnetVectorMapSpeedAverage;
+    std::vector<std::pair<uint32_t, subnet_counter_t>> speed_elements;
+    ipv4_host_counters.get_all_non_zero_average_speed_elements_as_pairs(speed_elements);
 
-    // Iterate over all networks
-    for (map_of_vector_counters_t::iterator itr = current_speed_map->begin(); itr != current_speed_map->end(); ++itr) {
+    for (const auto& speed_element : speed_elements) {
+        std::string client_ip_as_string = convert_ip_as_uint_to_string(speed_element.first);
 
-        // Iterate over all hosts in network
-        for (vector_of_counters_t::iterator vector_itr = itr->second.begin(); vector_itr != itr->second.end(); ++vector_itr) {
-            int current_index = vector_itr - itr->second.begin();
+        const subnet_counter_t* current_speed_element = &speed_element.second;
 
-            // convert to host order for math operations
-            uint32_t subnet_ip                     = ntohl(itr->first.subnet_address);
-            uint32_t client_ip_in_host_bytes_order = subnet_ip + current_index;
+        // Skip elements with zero speed
+        if (current_speed_element->is_zero()) {
+            continue;
+        }
 
-            // convert to our standard network byte order
-            uint32_t client_ip = htonl(client_ip_in_host_bytes_order);
+        std::string ip_as_string_with_dash_delimiters = client_ip_as_string;
+        // Replace dots by dashes
+        std::replace(ip_as_string_with_dash_delimiters.begin(), ip_as_string_with_dash_delimiters.end(), '.', '_');
 
-            std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
+        for (auto data_direction : processed_directions) {
+            std::string direction_as_string;
 
-            std::string ip_as_string_with_dash_delimiters = client_ip_as_string;
-            // Replace dots by dashes
-            std::replace(ip_as_string_with_dash_delimiters.begin(), ip_as_string_with_dash_delimiters.end(), '.', '_');
+            if (data_direction == INCOMING) {
+                direction_as_string = "incoming";
+            } else if (data_direction == OUTGOING) {
+                direction_as_string = "outgoing";
+            }
 
-            // Here we could have average or instantaneous speed
-            subnet_counter_t* current_speed_element = &*vector_itr;
+            std::string graphite_current_prefix = graphite_prefix + ".hosts." +
+                                                  ip_as_string_with_dash_delimiters + "." + direction_as_string;
 
-            for (auto data_direction : processed_directions) {
-                std::string direction_as_string;
 
-                if (data_direction == INCOMING) {
-                    direction_as_string = "incoming";
-                } else if (data_direction == OUTGOING) {
-                    direction_as_string = "outgoing";
+            if (data_direction == INCOMING) {
+                // Prepare incoming traffic data
+
+                // We do not store zero data to Graphite
+                if (current_speed_element->total.in_packets != 0) {
+                    graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.in_packets;
                 }
 
-                std::string graphite_current_prefix =
-                    graphite_prefix + ".hosts." + ip_as_string_with_dash_delimiters + "." + direction_as_string;
+                if (current_speed_element->total.in_bytes != 0) {
+                    graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.in_bytes * 8;
+                }
 
-                graphite_current_prefix = graphite_current_prefix + ".average";
+                if (current_speed_element->in_flows != 0) {
+                    graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->in_flows;
+                }
 
-                if (data_direction == INCOMING) {
-                    // Prepare incoming traffic data
+            } else if (data_direction == OUTGOING) {
+                // Prepare outgoing traffic data
 
-                    // We do not store zero data to Graphite
-                    if (current_speed_element->total.in_packets != 0) {
-                        graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.in_packets;
-                    }
+                // We do not store zero data to Graphite
+                if (current_speed_element->total.out_packets != 0) {
+                    graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.out_packets;
+                }
 
-                    if (current_speed_element->total.in_bytes != 0) {
-                        graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.in_bytes * 8;
-                    }
+                if (current_speed_element->total.out_bytes != 0) {
+                    graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.out_bytes * 8;
+                }
 
-                    if (current_speed_element->in_flows != 0) {
-                        graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->in_flows;
-                    }
-
-                } else if (data_direction == OUTGOING) {
-                    // Prepare outgoing traffic data
-
-                    // We do not store zero data to Graphite
-                    if (current_speed_element->total.out_packets != 0) {
-                        graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.out_packets;
-                    }
-
-                    if (current_speed_element->total.out_bytes != 0) {
-                        graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.out_bytes * 8;
-                    }
-
-                    if (current_speed_element->out_flows != 0) {
-                        graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->out_flows;
-                    }
+                if (current_speed_element->out_flows != 0) {
+                    graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->out_flows;
                 }
             }
         }
+    }
 
-        bool graphite_put_result = store_data_to_graphite(graphite_port, graphite_host, graphite_data);
+    bool graphite_put_result = store_data_to_graphite(graphite_port, graphite_host, graphite_data);
 
-        if (!graphite_put_result) {
-            logger << log4cpp::Priority::ERROR << "Can't store host load data to Graphite server " << graphite_host
-                   << " port: " << graphite_port;
-            return false;
-        }
+    if (!graphite_put_result) {
+        logger << log4cpp::Priority::ERROR << "Can't store host load data to Graphite server "
+               << graphite_host << " port: " << graphite_port;
+        return false;
     }
 
     return true;
 }
+
 
 // Push total counters to graphite
 bool push_total_traffic_counters_to_graphite() {
@@ -198,6 +189,7 @@ bool push_network_traffic_counters_to_graphite() {
 
 // This thread pushes speed counters to graphite
 void graphite_push_thread() {
+    
     // Sleep for a half second for shift against calculatiuon thread
     boost::this_thread::sleep(boost::posix_time::milliseconds(500));
 

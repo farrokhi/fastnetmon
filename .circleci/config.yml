@@ -2,31 +2,84 @@ version: 2.1
 parameters:
   fastnetmon_build_version:
     type: string
-    default: "1.2.5"
+    default: "1.2.7"
 orbs:
   win: circleci/windows@4.1
 jobs:
-  build_windows2019:
-    executor: win/server-2019
-    steps:
-      - run: 'Write-Host "Hello from FastNetMon"'
-  build_windows2022:
-    executor: win/server-2022
-    steps:
-      - run: 'Write-Host "Hello from FastNetMon"'
-  build_macos:
-    macos:
-      xcode: 13.2.1
+  build_windows:
+    parameters:
+      windows_name:
+        type: string
+      default_shell:
+        type: string
+        default: "c:/tools/msys64/msys2_shell.cmd -defterm -no-start -mingw64 -full-path -here"
+    executor: << parameters.windows_name >>
     steps:
       - checkout
+      - run: 'Write-Host "Hello from FastNetMon"'
+      - run: choco install -y --no-progress cmake --installargs "ADD_CMAKE_TO_PATH=User"
+      - run: choco install -y --no-progress msys2
+      - run: mkdir src/build
+      - run:
+          name: Install dependency libraries
+          shell: c:/tools/msys64/msys2_shell.cmd -defterm -no-start -msys2 -full-path -here -c
+          command: pacman -S --needed --noconfirm make mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-boost mingw-w64-x86_64-cmake  zip unzip  mingw-w64-x86_64-capnproto mingw-w64-x86_64-grpc mingw-w64-x86_64-openssl  mingw-w64-x86_64-hiredis mingw-w64-x86_64-librdkafka mingw-w64-x86_64-protobuf mingw-w64-x86_64-ncurses mingw-w64-x86_64-libpcap
+      - run:
+          name: Download log4cpp
+          shell: << parameters.default_shell >>
+          command: wget https://deac-riga.dl.sourceforge.net/project/log4cpp/log4cpp-1.1.x%20%28new%29/log4cpp-1.1/log4cpp-1.1.4.tar.gz
+      - run:
+          name: Unpack log4cpp 
+          shell: << parameters.default_shell >>
+          command: tar -xf log4cpp-1.1.4.tar.gz
+      - run: 
+          name: Patch log4cpp to compile it on msys2
+          shell: << parameters.default_shell >>
+          command: sed -i '/#define int64_t __int64/d' log4cpp/include/log4cpp/config-MinGW32.h
+      - run:
+          name: Patch tests
+          shell: << parameters.default_shell >>
+          command: sed -i 's/typedef int64_t usec_t;/#include <cstdint>\ntypedef int64_t usec_t;/' log4cpp/tests/Clock.hh 
+      - run:
+          name: Configure log4cpp
+          shell: << parameters.default_shell >>
+          command: cd log4cpp && ./configure
+      - run:
+          name: Build log4cpp
+          shell: << parameters.default_shell >>
+          command: cd log4cpp && make -j
+      - run:
+          name: Install log4cpp
+          shell: << parameters.default_shell >>
+          command: cd log4cpp && make install
+      - run:
+          name: Run cmake
+          shell: << parameters.default_shell >>
+          command: cmake -DENABLE_MONGODB_SUPPORT=FALSE -DENABLE_PCAP_SUPPORT=FALSE -DLINK_WITH_ABSL=TRUE -S src -B src/build
+      - run:
+          name: Build
+          shell: << parameters.default_shell >>
+          command: cd src/build && ninja
+  build_macos:
+    macos:
+      xcode: 13.4.1
+    environment:
+      # We need it to address Error: No head is defined for fastnetmon
+      # https://github.com/Homebrew/discussions/discussions/4136
+      HOMEBREW_NO_INSTALL_FROM_API: 1
+    steps:
+      - run: env
+      - checkout
       - run: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      - run: cp src/packaging/homebrew/fastnetmon.rb /usr/local/Homebrew/Library/Taps/homebrew/homebrew-core/Formula/fastnetmon.rb
+      - run: cp src/packaging/homebrew/fastnetmon.rb /usr/local/Homebrew/Library/Taps/homebrew/homebrew-core/Formula/f/fastnetmon.rb
       - run: brew install --build-from-source --HEAD --verbose --debug fastnetmon
   build_debian_upstream_package:
     machine:
       image: ubuntu-2204:current
     resource_class: large
     parameters:
+      docker_image:
+        type: string
       debian_codename:
         type: string
     steps:
@@ -35,12 +88,16 @@ jobs:
           command: sudo mkdir /data; sudo chmod 777 /data
       - run:
           name: Docker with priviledged mode to run chroot inside and we use tail -f to keep container running
-          command: sudo docker run -d -v /sys/fs/cgroup/:/sys/fs/cgroup:ro -v /data:/data:rw --privileged --cap-add SYS_ADMIN  --name linux_priviledged_container debian:bullseye tail -f /dev/null
+          command: sudo docker run -d -v /sys/fs/cgroup/:/sys/fs/cgroup:ro -v /data:/data:rw --privileged --cap-add SYS_ADMIN  --name linux_priviledged_container << parameters.docker_image >> tail -f /dev/null
       - run: sudo docker exec -it linux_priviledged_container apt-get update; true
+      - run:
+          name: Explicitly specify mirror to avoid pbuilder failure on configuration step
+          command: echo "MIRRORSITE=http://http.us.debian.org/debian"|  sudo docker exec -i linux_priviledged_container tee /etc/pbuilderrc
+      - run: sudo docker exec -it linux_priviledged_container cat /etc/pbuilderrc
       - run: sudo docker exec -it linux_priviledged_container apt install -y dpkg-dev git pbuilder
       - run: sudo docker exec -it linux_priviledged_container git clone https://github.com/pavel-odintsov/fastnetmon
       - run: sudo docker exec -it linux_priviledged_container git clone https://salsa.debian.org/debian/fastnetmon.git fastnetmon-debian-salsa
-      - run: sudo docker exec -it linux_priviledged_container rm fastnetmon-debian-salsa/debian/patches/series
+      - run: sudo docker exec -it linux_priviledged_container rm -f fastnetmon-debian-salsa/debian/patches/series
       - run: sudo docker exec -it linux_priviledged_container tar -czf fastnetmon_$(sudo docker exec -it linux_priviledged_container head -n 1 fastnetmon-debian-salsa/debian/changelog|awk '{print $2}'|sed 's/[()]//g' | sed -E 's/(\-[0-9]+)?$//').orig.tar.gz fastnetmon
       - run: sudo docker exec -it linux_priviledged_container ls -la
       - run: sudo docker exec -it linux_priviledged_container bash -c "cd fastnetmon && rm -rf debian && cp -a ../fastnetmon-debian-salsa/debian/ . && dpkg-buildpackage -S -sa -d"
@@ -63,10 +120,10 @@ jobs:
       image: ubuntu-2204:current
     steps:
      - checkout
-     - run: docker build -t ghcr.io/pavel-odintsov/fastnetmon-community:1.2.3 -t ghcr.io/pavel-odintsov/fastnetmon-community:latest - < src/Dockerfile
+     - run: docker build -t ghcr.io/pavel-odintsov/fastnetmon-community:<< pipeline.parameters.fastnetmon_build_version >> -t ghcr.io/pavel-odintsov/fastnetmon-community:latest - < src/Dockerfile
      - run: sudo docker images
      - run: echo $CR_PAT | sudo docker login ghcr.io -u pavel-odintsov --password-stdin
-     - run: sudo docker push ghcr.io/pavel-odintsov/fastnetmon-community:1.2.3
+     - run: sudo docker push ghcr.io/pavel-odintsov/fastnetmon-community:<< pipeline.parameters.fastnetmon_build_version >>
      - run: sudo docker push ghcr.io/pavel-odintsov/fastnetmon-community:latest
   build_gce:
     machine:
@@ -149,7 +206,26 @@ jobs:
           command: cd ~/rpmbuild/SPECS && rpmbuild -bb fastnetmon.spec
       - store_artifacts:
           path: /root/rpmbuild/RPMS/x86_64
-
+  build_debian_system_dependencies:
+    parameters:
+      docker_image:
+        type: string
+      resource_class:
+        type: string
+        default: large
+    machine:
+      image: ubuntu-2204:current
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+    resource_class: << parameters.resource_class >>
+    steps:
+      - run: sudo docker run --name  linux_docker -d -t << parameters.docker_image >>
+      - run: sudo docker exec linux_docker apt-get update; true
+      - run: sudo docker exec --env DEBIAN_FRONTEND linux_docker apt-get install -y perl wget git cmake g++ make liblog4cpp5-dev libhiredis-dev libmongoc-dev libbpf-dev libgrpc++-dev libprotobuf-dev protobuf-compiler libcapnp-dev capnproto libssl-dev protobuf-compiler-grpc libncurses5-dev libpcap-dev pkg-config  libboost-atomic-dev libboost-chrono-dev  libboost-date-time-dev libboost-program-options-dev libboost-regex-dev libboost-system-dev libboost-thread-dev
+      - run: sudo docker exec linux_docker git clone https://github.com/pavel-odintsov/fastnetmon.git
+      - run: sudo docker exec linux_docker mkdir fastnetmon/src/build
+      - run: sudo docker exec linux_docker cmake -S fastnetmon/src -B fastnetmon/src/build -DENABLE_AF_XDP_SUPPORT=FALSE
+      - run: sudo docker exec linux_docker make -C fastnetmon/src/build -j
   build_debian:
     parameters:
       docker_image:
@@ -161,50 +237,57 @@ jobs:
       s3cmd_install_command:
         type: string
         default: "apt-get install -y s3cmd"
-    docker:
-      - image: << parameters.docker_image >>
+      resource_class:
+        type: string
+        default: large
+      debian_package_architecture:
+        type: string
+        default: "amd64"
+    machine:
+      image: ubuntu-2204:current
     environment:
       DEBIAN_FRONTEND: noninteractive
-    resource_class: large
+    resource_class: << parameters.resource_class >>
     steps:
-      - checkout
-      - run: apt-get update; true
-      - run: apt-get install -y perl wget
-      - run: << parameters.s3cmd_install_command >>
+      - run: sudo docker run --name  linux_docker -d -t << parameters.docker_image >>
+      - run: sudo docker exec linux_docker apt-get update; true
+      - run: sudo docker exec linux_docker apt-get install -y perl wget git
+      - run: sudo docker exec --env DEBIAN_FRONTEND linux_docker bash -c "<< parameters.s3cmd_install_command >>"
+      - run: sudo docker exec linux_docker git clone https://github.com/pavel-odintsov/fastnetmon.git
       - run:
           name: install_gcc
           no_output_timeout: 120m 
-          command: perl src/scripts/install_fastnetmon_dependencies.pl gcc_12_1_0
+          command: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker perl fastnetmon/src/scripts/install_fastnetmon_dependencies.pl gcc_12_1_0
       - run:
           name: install_dependencies
           no_output_timeout: 180m
-          command: perl src/scripts/install_fastnetmon_dependencies.pl
-      - run:
-          name: collect_debug
-          command: cat /tmp/fastnetmon_install.log
-          when: on_fail
-      - run: perl src/scripts/fastnetmon_build.pl
-      - run: perl src/scripts/build_library_bundle.pl /opt/fastnetmon_libraries_bundle.tar.gz
-      - store_artifacts:
-          path: /tmp/fastnetmon_install.log
-      - run: src/scripts/build_any_package.pl deb /opt/fastnetmon_libraries_bundle.tar.gz << pipeline.parameters.fastnetmon_build_version >> << parameters.distro_name >> << parameters.distro_version >>
-      - run: s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket="%(bucket).storage.googleapis.com" put /tmp/fastnetmon_<< pipeline.parameters.fastnetmon_build_version >>_amd64.deb s3://fastnetmon_community_packages/<< pipeline.parameters.fastnetmon_build_version >>/<< parameters.distro_name >>/<< parameters.distro_version >>/fastnetmon_<< pipeline.parameters.fastnetmon_build_version >>_amd64.deb
-      - run: cp src/fastnetmon.conf /etc/fastnetmon.conf
-      - run: ldd /opt/fastnetmon-community/app/bin/fastnetmon
-      - run: ldd /opt/fastnetmon-community/app/bin/fastnetmon_client
-      - run: ldd /opt/fastnetmon-community/app/bin/fastnetmon_api_client
-      - run: /opt/fastnetmon-community/app/bin/fastnetmon_api_client --help
-      - run: /opt/fastnetmon-community/app/bin/fastnetmon_client --help
-      - run: /opt/fastnetmon-community/app/bin/fastnetmon --configuration_check
+          command: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker perl fastnetmon/src/scripts/install_fastnetmon_dependencies.pl
+      - run: sudo docker exec linux_docker perl fastnetmon/src/scripts/fastnetmon_build.pl
+      - run: sudo docker exec linux_docker perl fastnetmon/src/scripts/build_library_bundle.pl /opt/fastnetmon_libraries_bundle.tar.gz
+      - run: sudo docker exec linux_docker fastnetmon/src/scripts/build_any_package.pl deb /opt/fastnetmon_libraries_bundle.tar.gz << pipeline.parameters.fastnetmon_build_version >> << parameters.distro_name >> << parameters.distro_version >>
+      - run: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket="%(bucket).storage.googleapis.com" put /tmp/fastnetmon_<< pipeline.parameters.fastnetmon_build_version >>_<< parameters.debian_package_architecture >>.deb s3://fastnetmon_community_packages/<< pipeline.parameters.fastnetmon_build_version >>/<< parameters.distro_name >>/<< parameters.distro_version >>/fastnetmon_<< pipeline.parameters.fastnetmon_build_version >>_<< parameters.debian_package_architecture >>.deb
+      - run: sudo docker exec linux_docker cp fastnetmon/src/fastnetmon.conf /etc/fastnetmon.conf
+      - run: sudo docker exec linux_docker ldd /opt/fastnetmon-community/app/bin/fastnetmon
+      - run: sudo docker exec linux_docker ldd /opt/fastnetmon-community/app/bin/fastnetmon_client
+      - run: sudo docker exec linux_docker ldd /opt/fastnetmon-community/app/bin/fastnetmon_api_client
+      - run: sudo docker exec linux_docker /opt/fastnetmon-community/app/bin/fastnetmon_api_client --help
+      - run: sudo docker exec linux_docker /opt/fastnetmon-community/app/bin/fastnetmon_client --help
+      - run: sudo docker exec linux_docker /opt/fastnetmon-community/app/bin/fastnetmon --configuration_check
   build_centos:
     parameters:
       docker_image:
         type: string
       centos_version:
         type: string
+      resource_class:
+        type: string
+        default: large
+      centos_package_architecture:
+        type: string
+        default: "x86_64"
     machine:
       image: ubuntu-2204:current
-    resource_class: large
+    resource_class: << parameters.resource_class >>
     steps:
       - run: sudo docker run --name  linux_docker -d -t << parameters.docker_image >>
       - run: sudo docker exec linux_docker yum install -y perl wget python3-pip perl-Archive-Tar git
@@ -218,14 +301,10 @@ jobs:
           name: install_dependencies
           no_output_timeout: 180m
           command: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker perl fastnetmon/src/scripts/install_fastnetmon_dependencies.pl
-      - run:
-          name: collect_debug
-          command: sudo docker exec linux_docker cat /tmp/fastnetmon_install.log
-          when: on_fail
       - run: sudo docker exec linux_docker perl fastnetmon/src/scripts/fastnetmon_build.pl
       - run: sudo docker exec linux_docker perl fastnetmon/src/scripts/build_library_bundle.pl /opt/fastnetmon_libraries_bundle.tar.gz
       - run: sudo docker exec linux_docker fastnetmon/src/scripts/build_any_package.pl rpm /opt/fastnetmon_libraries_bundle.tar.gz << pipeline.parameters.fastnetmon_build_version >> centos << parameters.centos_version >>
-      - run: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket="%(bucket).storage.googleapis.com" put /tmp/result_data/fastnetmon-<< pipeline.parameters.fastnetmon_build_version >>-1.el<< parameters.centos_version >>.x86_64.rpm s3://fastnetmon_community_packages/<< pipeline.parameters.fastnetmon_build_version >>/centos/<< parameters.centos_version >>/fastnetmon-<< pipeline.parameters.fastnetmon_build_version >>-1.el<< parameters.centos_version >>.x86_64.rpm
+      - run: sudo -E docker exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY linux_docker s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket="%(bucket).storage.googleapis.com" put /tmp/result_data/fastnetmon-<< pipeline.parameters.fastnetmon_build_version >>-1.el<< parameters.centos_version >>.<< parameters.centos_package_architecture >>.rpm s3://fastnetmon_community_packages/<< pipeline.parameters.fastnetmon_build_version >>/centos/<< parameters.centos_version >>/fastnetmon-<< pipeline.parameters.fastnetmon_build_version >>-1.el<< parameters.centos_version >>.<< parameters.centos_package_architecture >>.rpm
       - run: sudo docker exec linux_docker cp fastnetmon/src/fastnetmon.conf /etc/fastnetmon.conf
       - run: sudo docker exec linux_docker ldd /opt/fastnetmon-community/app/bin/fastnetmon
       - run: sudo docker exec linux_docker ldd /opt/fastnetmon-community/app/bin/fastnetmon_client
@@ -246,19 +325,45 @@ workflows:
           centos_version: "8"
           name: "centos8"
       - build_centos:
+          docker_image: almalinux:8
+          centos_version: "8"
+          name: "centos8_arm"
+          resource_class: "arm.large"
+          centos_package_architecture: "aarch64"
+      - build_centos:
           docker_image: almalinux:9
           centos_version: "9"
           name: "centos9"
+      - build_centos:
+          docker_image: almalinux:9
+          centos_version: "9"
+          name: "centos9_arm"
+          resource_class: "arm.large"
+          centos_package_architecture: "aarch64"
       - build_debian:
           docker_image: "ubuntu:jammy"
           distro_version: "22.04"
           name: "ubuntu2204"
           distro_name: "ubuntu"
       - build_debian:
+          docker_image: "ubuntu:jammy"
+          distro_version: "22.04"
+          name: "ubuntu2204_arm"
+          distro_name: "ubuntu"
+          resource_class: "arm.large"
+          debian_package_architecture: "arm64"
+      - build_debian:
           docker_image: "ubuntu:focal"
           distro_version: "20.04"
           name: "ubuntu2004"
           distro_name: "ubuntu"
+      - build_debian:
+          docker_image: "ubuntu:focal"
+          distro_version: "20.04"
+          name: "ubuntu2004_arm"
+          distro_name: "ubuntu"
+          resource_class: "arm.large"
+          debian_package_architecture: "arm64"
       - build_debian:
           docker_image: "ubuntu:bionic"
           distro_version: "18.04"
@@ -270,32 +375,52 @@ workflows:
           name: "ubuntu1604"
           distro_name: "ubuntu"
       - build_debian:
-          docker_image: "debian:stretch"
-          distro_version: "9"
-          name: "debian9"
-          distro_name: "debian"
-      - build_debian:
           docker_image: "debian:buster"
           distro_version: "10"
           name: "debian10"
           distro_name: "debian"
-          # We do it this way because this version of Debian has no s3cmd in official repos for some reasons: https://packages.debian.org/sid/utils/s3cmd
-          s3cmd_install_command: "apt-get install -y python3-pip; pip3 install s3cmd"
+          # We do it this way because this version of Debian has no s3cmd in official repos for some reasons: https://packages.debian.org/buster-backports/s3cmd
+          s3cmd_install_command: "apt-get install -y python3-pip && pip3 install s3cmd"
       - build_debian:
           docker_image: "debian:bullseye"
           distro_version: "11"
           name: "debian11"
           distro_name: "debian"
       - build_debian:
+          docker_image: "debian:bullseye"
+          distro_version: "11"
+          name: "debian11_arm"
+          distro_name: "debian"
+          resource_class: "arm.large"
+          debian_package_architecture: "arm64"
+      - build_debian:
           docker_image: "debian:bookworm"
           distro_version: "12"
           name: "debian12"
           distro_name: "debian"
+      - build_debian:
+          docker_image: "debian:bookworm"
+          distro_version: "12"
+          name: "debian12_arm"
+          distro_name: "debian"
+          resource_class: "arm.large"
+          debian_package_architecture: "arm64"
       - build_docker_x86_64:
           name: "Build Docker image on x86_64 platform"
+      # - build_docker_arm64:
+      #    name: "Build Docker image on ARM64 platform"
       - build_debian_upstream_package:
           name: "Debian Sid Upstream Build"
           debian_codename: "sid"
+          docker_image: "debian:bookworm"
+      # To offer great developer experience we ensure that FastNetMon can be built on latest Ubuntu LTS 
+      - build_debian_system_dependencies:
+          docker_image: "ubuntu:jammy"
+          name: "ubuntu2204_system_dependencies"
+      # it's broken due to some changes in Sid
+      #- build_debian_system_dependencies:
+      #    docker_image: "debian:sid"
+      #    name: "debian_sid_system_dependencies"
       - build_fedora_upstream:
           name: "Fedora 36 Upstream RPM"
           docker_image: fedora:36
@@ -309,7 +434,9 @@ workflows:
           name: "EPEL 9 RPM"
       - build_macos:
           name: "Build on MacOS"
-      - build_windows2022:
+      - build_windows:
           name: "Build on Windows Server 2022"
-      - build_windows2019:
+          windows_name: "win/server-2022"
+      - build_windows:
           name: "Build on Windows Server 2019"
+          windows_name: "win/server-2019"

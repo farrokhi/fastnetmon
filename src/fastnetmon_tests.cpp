@@ -3,8 +3,6 @@
 
 #include "fast_library.hpp"
 
-#include "bgp_protocol.hpp"
-
 #include <fstream>
 
 #include "log4cpp/Appender.hh"
@@ -20,67 +18,6 @@
 
 log4cpp::Category& logger = log4cpp::Category::getRoot();
 
-// Flow Spec actions tests
-
-TEST(BgpFlowSpecAction, rate_limit) {
-    bgp_flow_spec_action_t my_action;
-    my_action.set_type(FLOW_SPEC_ACTION_RATE_LIMIT);
-    my_action.set_rate_limit(1024);
-
-    EXPECT_EQ(my_action.serialize(), "rate-limit 1024;");
-}
-
-TEST(BgpFlowSpecAction, discard) {
-    bgp_flow_spec_action_t my_action;
-    my_action.set_type(FLOW_SPEC_ACTION_DISCARD);
-
-    EXPECT_EQ(my_action.serialize(), "discard;");
-}
-
-TEST(BgpFlowSpecAction, accept) {
-    bgp_flow_spec_action_t my_action;
-    my_action.set_type(FLOW_SPEC_ACTION_ACCEPT);
-
-    EXPECT_EQ(my_action.serialize(), "accept;");
-}
-
-TEST(BgpFlowSpecAction, default_constructor) {
-    bgp_flow_spec_action_t my_action;
-
-    EXPECT_EQ(my_action.serialize(), "accept;");
-}
-
-// Serializers tests
-
-TEST(serialize_vector_by_string, single_element) {
-    std::vector<std::string> vect;
-    vect.push_back("123");
-
-    EXPECT_EQ(serialize_vector_by_string(vect, ","), "123");
-}
-
-TEST(serialize_vector_by_string, few_elements) {
-    std::vector<std::string> vect;
-    vect.push_back("123");
-    vect.push_back("456");
-
-    EXPECT_EQ(serialize_vector_by_string(vect, ","), "123,456");
-}
-
-TEST(serialize_vector_by_string_with_prefix, single_element) {
-    std::vector<uint16_t> vect;
-    vect.push_back(123);
-
-    EXPECT_EQ(serialize_vector_by_string_with_prefix(vect, ",", "^"), "^123");
-}
-
-TEST(serialize_vector_by_string_with_prefix, few_elements) {
-    std::vector<uint16_t> vect;
-    vect.push_back(123);
-    vect.push_back(456);
-
-    EXPECT_EQ(serialize_vector_by_string_with_prefix(vect, ",", "^"), "^123,^456");
-}
 
 /* Patricia tests */
 
@@ -103,6 +40,18 @@ TEST(patricia, negative_lookup_ipv6_prefix) {
     bool found = patricia_search_best2(lookup_ipv6_tree, &prefix_for_check_address, 1) != NULL;
 
     EXPECT_EQ(found, false);
+}
+
+TEST(convert_ip_as_string_to_uint_test, convert_ip_as_string_to_uint) {
+    uint32_t ip = 0;
+
+    convert_ip_as_string_to_uint_safe("255.255.255.0", ip);
+
+    EXPECT_EQ(ip, convert_cidr_to_binary_netmask(24));
+
+    convert_ip_as_string_to_uint_safe("255.255.255.255", ip);
+
+    EXPECT_EQ(ip, convert_cidr_to_binary_netmask(32));
 }
 
 TEST(patricia, positive_lookup_ipv6_prefix) {

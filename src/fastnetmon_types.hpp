@@ -1,7 +1,12 @@
 #ifndef FASTNETMON_TYPES_H
 #define FASTNETMON_TYPES_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <netinet/in.h> // struct in6_addr
+#endif
+
 #include <stdint.h> // uint32_t
 #include <sys/time.h> // struct timeval
 
@@ -25,6 +30,8 @@
 
 enum attack_severity_t { ATTACK_SEVERITY_LOW, ATTACK_SEVERITY_MIDDLE, ATTACK_SEVERITY_HIGH };
 
+// Attack action types
+enum class attack_action_t { ban, unban };
 
 // Kafka traffic export formats
 enum class kafka_traffic_export_format_t : uint32_t { Unknown = 0, JSON = 1, Protobuf = 2 };
@@ -285,83 +292,6 @@ class total_speed_counters_t {
 };
 
 
-// structure with attack details
-class attack_details_t : public subnet_counter_t {
-    public:
-    // This operation is very heavy, it may crash in case of entropy shortage and it actually happened to our customer
-    bool generate_uuid() {
-        boost::uuids::random_generator gen;
-
-        try {
-            attack_uuid = gen();
-        } catch (...) {
-            return false;
-        }
-
-        return true;
-    }
-
-    std::string get_protocol_name() const {
-        if (ipv6) {
-            return "IPv6";
-        } else {
-            return "IPv4";
-        }
-    }
-
-    // Host group for this attack
-    std::string host_group;
-
-    // Parent hostgroup for host's host group
-    std::string parent_host_group;
-
-    direction_t attack_direction = OTHER;
-
-    // first attackpower detected
-    uint64_t attack_power = 0;
-
-    // max attack power
-    uint64_t max_attack_power    = 0;
-    unsigned int attack_protocol = 0;
-
-    // Average counters
-    uint64_t average_in_bytes    = 0;
-    uint64_t average_out_bytes   = 0;
-    uint64_t average_in_packets  = 0;
-    uint64_t average_out_packets = 0;
-    uint64_t average_in_flows    = 0;
-    uint64_t average_out_flows   = 0;
-
-    // Time when we ban this IP
-    time_t ban_timestamp = 0;
-    bool unban_enabled   = true;
-    int ban_time         = 0; // seconds of the ban
-
-    // If this attack was detected for IPv6 protocol
-    bool ipv6 = false;
-
-    subnet_cidr_mask_t customer_network;
-
-    attack_detection_source_t attack_detection_source = attack_detection_source_t::Automatic;
-    boost::uuids::uuid attack_uuid{};
-    attack_severity_t attack_severity = ATTACK_SEVERITY_MIDDLE;
-
-    // Threshold used to trigger this attack
-    attack_detection_threshold_type_t attack_detection_threshold = attack_detection_threshold_type_t::unknown;
-
-    packet_storage_t pcap_attack_dump;
-
-    // Direction of threshold used to trigger this attack
-    attack_detection_direction_type_t attack_detection_direction = attack_detection_direction_type_t::unknown;
-
-    std::string get_attack_uuid_as_string() const {
-        return boost::uuids::to_string(attack_uuid);
-    }
-};
-
-
-typedef attack_details_t banlist_item_t;
-
 // struct for save per direction and per protocol details for flow
 class conntrack_key_struct_t {
     public:
@@ -396,9 +326,7 @@ typedef std::vector<subnet_counter_t> vector_of_counters;
 typedef std::map<subnet_cidr_mask_t, vector_of_counters> map_of_vector_counters_t;
 
 // Flow tracking structures
-typedef std::vector<conntrack_main_struct_t> vector_of_flow_counters_t;
-typedef std::map<subnet_cidr_mask_t, vector_of_flow_counters_t> map_of_vector_counters_for_flow_t;
-
+typedef std::map<uint32_t, conntrack_main_struct_t> map_of_vector_counters_for_flow_t;
 
 typedef subnet_counter_t subnet_counter_t;
 typedef std::pair<subnet_cidr_mask_t, subnet_counter_t> pair_of_map_for_subnet_counters_elements_t;

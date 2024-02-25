@@ -2,24 +2,34 @@
 Status FastnetmonApiServiceImpl::GetBanlist(::grpc::ServerContext* context,
                                             const ::fastmitigation::BanListRequest* request,
                                             ::grpc::ServerWriter<::fastmitigation::BanListReply>* writer) {
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
+
     logger << log4cpp::Priority::INFO << "API we asked for banlist";
 
-    for (std::map<uint32_t, banlist_item_t>::iterator itr = ban_list.begin(); itr != ban_list.end(); ++itr) {
-        std::string client_ip_as_string = convert_ip_as_uint_to_string(itr->first);
+    // IPv4
+    std::map<uint32_t, banlist_item_t> ban_list_ipv4_copy;
 
+    // Get whole ban list content atomically
+    ban_list_ipv4.get_whole_banlist(ban_list_ipv4_copy);
+
+    for (auto itr : ban_list_ipv4_copy) {
         BanListReply reply;
-        reply.set_ip_address(client_ip_as_string + "/32");
+
+        reply.set_ip_address(convert_ip_as_uint_to_string(itr.first) + "/32");
+        
         writer->Write(reply);
     }
 
     // IPv6
-    std::map<subnet_ipv6_cidr_mask_t, banlist_item_t> ban_list_copy;
+    std::map<subnet_ipv6_cidr_mask_t, banlist_item_t> ban_list_ipv6_copy;
 
     // Get whole ban list content atomically
-    ban_list_ipv6_ng.get_whole_banlist(ban_list_copy);
+    ban_list_ipv6.get_whole_banlist(ban_list_ipv6_copy);
 
 
-    for (auto itr : ban_list_copy) {
+    for (auto itr : ban_list_ipv6_copy) {
         BanListReply reply;
         reply.set_ip_address(print_ipv6_cidr_subnet(itr.first));
         writer->Write(reply);
@@ -31,6 +41,9 @@ Status FastnetmonApiServiceImpl::GetBanlist(::grpc::ServerContext* context,
 Status FastnetmonApiServiceImpl::ExecuteBan(ServerContext* context,
                                             const fastmitigation::ExecuteBanRequest* request,
                                             fastmitigation::ExecuteBanReply* reply) {
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
     logger << log4cpp::Priority::INFO << "API we asked for ban for IP: " << request->ip_address();
 
     if (!validate_ipv6_or_ipv4_host(request->ip_address())) {
@@ -60,20 +73,30 @@ Status FastnetmonApiServiceImpl::ExecuteBan(ServerContext* context,
 
     boost::circular_buffer<simple_packet_t> empty_simple_packets_buffer;
 
+    // Empty raw buffer
+    boost::circular_buffer<fixed_size_packet_storage_t> empty_raw_packets_buffer;
+
     std::string flow_attack_details = "manually triggered attack";
 
     if (ipv4) {
-        client_ip = convert_ip_as_string_to_uint(request->ip_address());
+        bool parse_res = convert_ip_as_string_to_uint_safe(request->ip_address(), client_ip);
 
-        {
-            std::lock_guard<std::mutex> lock_guard(ban_list_mutex);
-            ban_list[client_ip] = current_attack;
+        if (!parse_res) {
+            logger << log4cpp::Priority::ERROR << "Can't parse IPv4 address: " << request->ip_address();
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Can't parse IPv4 address");
         }
 
-        {
-            std::lock_guard<std::mutex> lock_guard(ban_list_details_mutex);
-            ban_list_details[client_ip] = std::vector<simple_packet_t>();
+        subnet_cidr_mask_t subnet;
+
+        bool lookup_result =
+            lookup_ip_in_integer_form_inpatricia_and_return_subnet_if_found(lookup_tree_ipv4, client_ip, subnet);
+
+        if (!lookup_result) {
+            logger << log4cpp::Priority::ERROR << "IP address " << request->ip_address() << " does not belong to our networks.";
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "This IP does not belong to our subnets");
         }
+
+        ban_list_ipv4.add_to_blackhole(client_ip, current_attack);
     } else {
         bool parsed_ipv6 = read_ipv6_host_from_string(request->ip_address(), ipv6_address.subnet_address);
 
@@ -89,12 +112,12 @@ Status FastnetmonApiServiceImpl::ExecuteBan(ServerContext* context,
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "This IP not belongs to our subnets");
         }
 
-        ban_list_ipv6_ng.add_to_blackhole(ipv6_address, current_attack);
+        ban_list_ipv6.add_to_blackhole(ipv6_address, current_attack);
     }
 
     logger << log4cpp::Priority::INFO << "API call ban handlers manually";
-    call_ban_handlers(client_ip, ipv6_address, ipv6, current_attack, flow_attack_details,
-                      attack_detection_source_t::Automatic, "", empty_simple_packets_buffer);
+    call_blackhole_actions_per_host(attack_action_t::ban, client_ip, ipv6_address, ipv6, current_attack,
+                      attack_detection_source_t::Automatic, flow_attack_details, empty_simple_packets_buffer, empty_raw_packets_buffer);
 
     return Status::OK;
 }
@@ -102,6 +125,9 @@ Status FastnetmonApiServiceImpl::ExecuteBan(ServerContext* context,
 Status FastnetmonApiServiceImpl::ExecuteUnBan(ServerContext* context,
                                               const fastmitigation::ExecuteBanRequest* request,
                                               fastmitigation::ExecuteBanReply* reply) {
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
     logger << log4cpp::Priority::INFO << "API: We asked for unban for IP: " << request->ip_address();
 
     if (!validate_ipv6_or_ipv4_host(request->ip_address())) {
@@ -127,24 +153,27 @@ Status FastnetmonApiServiceImpl::ExecuteUnBan(ServerContext* context,
 
 
     if (ipv4) {
-        client_ip = convert_ip_as_string_to_uint(request->ip_address());
+        bool parse_res = convert_ip_as_string_to_uint_safe(request->ip_address(), client_ip);
 
-        if (ban_list.count(client_ip) == 0) {
-            logger << log4cpp::Priority::ERROR << "API: Could not find IP in ban list";
+        if (!parse_res) {
+            logger << log4cpp::Priority::ERROR << "Can't parse IPv4 address: " << request->ip_address();
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Can't parse IPv4 address");
+        }   
+
+        bool is_blackholed_ipv4 = ban_list_ipv4.is_blackholed(client_ip);
+
+        if (!is_blackholed_ipv4) {
+            logger << log4cpp::Priority::ERROR << "API: Could not find IPv4 address in ban list";
             return Status::CANCELLED;
         }
 
-        current_attack = ban_list[client_ip];
+        bool get_details = ban_list_ipv4.get_blackhole_details(client_ip, current_attack);
 
-        logger << log4cpp::Priority::INFO << "API: call unban handlers";
-
-        logger << log4cpp::Priority::INFO << "API: remove IP from ban list";
-
-        {
-            std::lock_guard<std::mutex> lock_guard(ban_list_mutex);
-            ;
-            ban_list.erase(client_ip);
+        if (!get_details) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Could not get IPv4 blackhole details");
         }
+
+        ban_list_ipv4.remove_from_blackhole(client_ip);
     } else {
         bool parsed_ipv6 = read_ipv6_host_from_string(request->ip_address(), ipv6_address.subnet_address);
 
@@ -153,23 +182,31 @@ Status FastnetmonApiServiceImpl::ExecuteUnBan(ServerContext* context,
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Can't parse IPv6 address");
         }
 
-        bool is_blackholed_ipv6 = ban_list_ipv6_ng.is_blackholed(ipv6_address);
+        bool is_blackholed_ipv6 = ban_list_ipv6.is_blackholed(ipv6_address);
 
         if (!is_blackholed_ipv6) {
             logger << log4cpp::Priority::ERROR << "API: Could not find IPv6 address in ban list";
             return Status::CANCELLED;
         }
 
-        bool get_details = ban_list_ipv6_ng.get_blackhole_details(ipv6_address, current_attack);
+        bool get_details = ban_list_ipv6.get_blackhole_details(ipv6_address, current_attack);
 
         if (!get_details) {
             return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Could not get IPv6 blackhole details");
         }
 
-        ban_list_ipv6_ng.remove_from_blackhole(ipv6_address);
+        ban_list_ipv6.remove_from_blackhole(ipv6_address);
     }
 
-    call_unban_handlers(client_ip, ipv6_address, ipv6, current_attack, attack_detection_source_t::Automatic);
+    // It's empty for unban
+    std::string flow_attack_details;
+
+    // These are empty too
+    boost::circular_buffer<simple_packet_t> simple_packets_buffer;
+    boost::circular_buffer<fixed_size_packet_storage_t> raw_packets_buffer;
+
+    call_blackhole_actions_per_host(attack_action_t::unban, client_ip, ipv6_address, ipv6,
+            current_attack, attack_detection_source_t::Automatic, flow_attack_details, simple_packets_buffer, raw_packets_buffer);
 
     return Status::OK;
 }

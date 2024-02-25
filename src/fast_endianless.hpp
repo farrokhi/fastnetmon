@@ -1,18 +1,29 @@
 #pragma once
 
-#include <arpa/inet.h>
+#include <cstdint>
 
-#if defined(__APPLE__)
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif 
+
+// 64 bit endian-less transformation functions are platform specific
+#ifdef __APPLE__
+
 #include <libkern/OSByteOrder.h>
-// Source: https://gist.github.com/pavel-odintsov/d13684600423d1c5e64e
 #define be64toh(x) OSSwapBigToHostInt64(x)
 #define htobe64(x) OSSwapHostToBigInt64(x)
+
+#elif _WIN32
+#define be64toh(x) _byteswap_uint64(x) 
+#define htobe64(x) _byteswap_uint64(x)
+
 #endif
 
-// For be64toh and htobe64
+// We need this include for be64toh and htobe64 on FreeBSD platforms
 #if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <sys/endian.h>
-#include <cstdint>
 #endif
 
 // Linux standard functions for endian conversions are ugly because there are no checks about arguments length

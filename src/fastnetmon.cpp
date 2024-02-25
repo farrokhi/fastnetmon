@@ -1,29 +1,14 @@
 /* Author: pavel.odintsov@gmail.com */
 /* License: GPLv2 */
 
-#include <errno.h>
-#include <math.h>
 #include <new>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
 
-#include <arpa/inet.h>
-#include <net/if_arp.h> // struct arphdr
-#include <netinet/if_ether.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/ip_icmp.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
-#include <sys/resource.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
+// We have it on all non Windows platofms
+#ifndef _WIN32
+#include <sys/resource.h> // setrlimit
+#endif
 
-#include "bgp_protocol.hpp"
 #include "fast_library.hpp"
 #include "fastnetmon_types.hpp"
 #include "libpatricia/patricia.hpp"
@@ -33,6 +18,8 @@
 #include "fast_platform.hpp"
 
 #include "fastnetmon_logic.hpp"
+
+#include "fast_endianless.hpp"
 
 #ifdef FASTNETMON_API
 
@@ -54,7 +41,11 @@
 
 // Plugins
 #include "netflow_plugin/netflow_collector.hpp"
+
+#ifdef ENABLE_PCAP
 #include "pcap_plugin/pcap_collector.hpp"
+#endif
+
 #include "sflow_plugin/sflow_collector.hpp"
 
 #ifdef NETMAP_PLUGIN
@@ -93,6 +84,12 @@
 #include <boost/program_options.hpp>
 
 #include "all_logcpp_libraries.hpp"
+
+// We do not have syslog.h on Windows
+#ifndef _WIN32
+#include <log4cpp/RemoteSyslogAppender.hh>
+#include <log4cpp/SyslogAppender.hh>
+#endif
 
 // Boost libs
 #include <boost/algorithm/string.hpp>
@@ -160,14 +157,14 @@ unsigned int stats_thread_initial_call_delay = 30;
 
 std::string reporting_server = "community-stats.fastnetmon.com";
 
-// Path to temporarily store backtrace when fatal failure happened
-std::string backtrace_path = "/var/log/fastnetmon_backtrace.dump";
-
 // Each this seconds we will check about available data in bucket
 unsigned int check_for_availible_for_processing_packets_buckets = 1;
 
 // Current time with pretty low precision, we use separate thread to update it
 time_t current_inaccurate_time = 0;
+
+// This is thread safe storage for captured from the wire packets for IPv4 traffic
+packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
 
 // This is thread safe storage for captured from the wire packets for IPv6 traffic
 packet_buckets_storage_t<subnet_ipv6_cidr_mask_t> packet_buckets_ipv6_storage;
@@ -239,6 +236,8 @@ bool monitor_openvz_vps_ip_addresses = false;
 // We will announce whole subnet instead single IP with BGP if this flag enabled
 bool exabgp_announce_whole_subnet = false;
 
+std::string exabgp_command_pipe = "";
+
 // We will announce only /32 host
 bool exabgp_announce_host = false;
 
@@ -277,7 +276,7 @@ bool enable_connection_tracking = true;
 
 bool enable_afpacket_collection         = false;
 bool enable_af_xdp_collection           = false;
-bool enable_data_collection_from_mirror = true;
+bool enable_data_collection_from_mirror = false;
 bool enable_netmap_collection           = false;
 bool enable_sflow_collection            = false;
 bool enable_netflow_collection          = false;
@@ -371,8 +370,6 @@ uint64_t our_ipv6_packets = 0;
 uint64_t incoming_total_flows_speed = 0;
 uint64_t outgoing_total_flows_speed = 0;
 
-map_of_vector_counters_t SubnetVectorMap;
-
 // Network counters for IPv6
 abstract_subnet_counters_t<subnet_ipv6_cidr_mask_t, subnet_counter_t> ipv6_subnet_counters;
 
@@ -381,6 +378,9 @@ abstract_subnet_counters_t<subnet_ipv6_cidr_mask_t, subnet_counter_t> ipv6_host_
 
 // Here we store traffic per subnet
 abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_counters;
+
+// Host counters for IPv4
+abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
 
 // Flow tracking structures
 map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
@@ -391,30 +391,17 @@ int64_t netflow_ipfix_all_protocols_total_flows_speed          = 0;
 std::string sflow_raw_packet_headers_total_speed_desc = "Number of sFlow headers per second";
 int64_t sflow_raw_packet_headers_total_speed          = 0;
 
-/* End of our data structs */
-std::mutex ban_list_details_mutex;
-std::mutex ban_list_mutex;
-std::mutex flow_counter;
-
-// map for flows
-std::map<uint64_t, int> FlowCounter;
-
-// Struct for string speed per IP
-map_of_vector_counters_t SubnetVectorMapSpeed;
-
-// Struct for storing average speed per IP for specified interval
-map_of_vector_counters_t SubnetVectorMapSpeedAverage;
+std::mutex flow_counter_mutex;
 
 #ifdef GEOIP
 map_for_counters GeoIpCounter;
 #endif
 
-// IPv6 hosts
-blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6_ng;
+// Banned IPv6 hosts
+blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
 
-// In ddos info we store attack power and direction
-std::map<uint32_t, banlist_item_t> ban_list;
-std::map<uint32_t, std::vector<simple_packet_t>> ban_list_details;
+// Banned IPv4 hosts
+blackhole_ban_list_t<uint32_t> ban_list_ipv4;
 
 host_group_map_t host_groups;
 
@@ -435,7 +422,6 @@ std::string exabgp_community_subnet = "";
 std::string exabgp_community_host   = "";
 
 
-std::string exabgp_command_pipe = "/var/run/exabgp.cmd";
 std::string exabgp_next_hop     = "";
 
 // Graphite monitoring
@@ -578,8 +564,16 @@ void parse_hostgroups(std::string name, std::string value) {
 
     // Split networks
     std::vector<std::string> hostgroup_subnets = split_strings_to_vector_by_comma(splitted_new_host_group[1]);
+
     for (std::vector<std::string>::iterator itr = hostgroup_subnets.begin(); itr != hostgroup_subnets.end(); ++itr) {
-        subnet_cidr_mask_t subnet = convert_subnet_from_string_to_binary_with_cidr_format(*itr);
+        subnet_cidr_mask_t subnet;
+
+        bool subnet_parse_result = convert_subnet_from_string_to_binary_with_cidr_format_safe(*itr, subnet);
+
+        if (!subnet_parse_result) {
+            logger << log4cpp::Priority::ERROR << "Cannot parse subnet " << *itr;
+            continue;
+        }
 
         host_groups[host_group_name].push_back(subnet);
 
@@ -907,18 +901,18 @@ bool load_configuration_file() {
 
     logging_configuration = read_logging_settings(configuration_map);
 
-    // logger << log4cpp::Priority::INFO << "We read global ban settings: " << print_ban_thresholds(global_ban_settings);
+    logger << log4cpp::Priority::INFO << "We read global ban settings: " << print_ban_thresholds(global_ban_settings);
 
     // Read host group ban settings
-    for (host_group_map_t::iterator hostgroup_itr = host_groups.begin(); hostgroup_itr != host_groups.end(); ++hostgroup_itr) {
+    for (auto hostgroup_itr = host_groups.begin(); hostgroup_itr != host_groups.end(); ++hostgroup_itr) {
         std::string host_group_name = hostgroup_itr->first;
 
-        logger << log4cpp::Priority::INFO << "We will read ban settings for " << host_group_name;
+        logger << log4cpp::Priority::DEBUG << "We will read ban settings for " << host_group_name;
 
         host_group_ban_settings_map[host_group_name] = read_ban_settings(configuration_map, host_group_name);
 
-        // logger << log4cpp::Priority::INFO << "We read " << host_group_name << " ban settings "
-        //    << print_ban_thresholds(host_group_ban_settings_map[ host_group_name ]);
+        logger << log4cpp::Priority::DEBUG << "We read " << host_group_name << " ban settings "
+            << print_ban_thresholds(host_group_ban_settings_map[ host_group_name ]);
     }
 
     if (configuration_map.count("white_list_path") != 0) {
@@ -1064,7 +1058,8 @@ bool load_configuration_file() {
     return true;
 }
 
-/* Enable core dumps for simplify debug tasks */
+// Enable core dumps for simplify debug tasks 
+#ifndef _WIN32
 void enable_core_dumps() {
     struct rlimit rlim;
 
@@ -1078,6 +1073,7 @@ void enable_core_dumps() {
         setrlimit(RLIMIT_CORE, &rlim);
     }
 }
+#endif
 
 void subnet_vectors_allocator(prefix_t* prefix, void* data) {
     // Network byte order
@@ -1088,38 +1084,44 @@ void subnet_vectors_allocator(prefix_t* prefix, void* data) {
     int network_size_in_ips = pow(base, 32 - bitlen);
     // logger<< log4cpp::Priority::INFO<<"Subnet: "<<prefix->add.sin.s_addr<<" network size:
     // "<<network_size_in_ips;
-    logger << log4cpp::Priority::INFO << "I will allocate " << network_size_in_ips << " records for subnet "
-           << subnet_as_integer << " cidr mask: " << bitlen;
-
+   
     subnet_cidr_mask_t current_subnet(subnet_as_integer, bitlen);
 
+    logger << log4cpp::Priority::INFO << "I will allocate " << network_size_in_ips << " records for subnet "
+           << convert_ipv4_subnet_to_string(current_subnet);
+
     subnet_counter_t zero_map_element{};
 
-    // Initilize our counters with fill constructor
-    try {
-        SubnetVectorMap[current_subnet]             = vector_of_counters(network_size_in_ips, zero_map_element);
-        SubnetVectorMapSpeed[current_subnet]        = vector_of_counters(network_size_in_ips, zero_map_element);
-        SubnetVectorMapSpeedAverage[current_subnet] = vector_of_counters(network_size_in_ips, zero_map_element);
-    } catch (std::bad_alloc& ba) {
-        logger << log4cpp::Priority::ERROR << "Can't allocate memory for counters";
-        exit(1);
+    for (int i = 0; i < network_size_in_ips; i++) {
+        // We need to increment IP address by X but we have to do so in little endian / host byte order
+        // incrementing big endian will not work as we expect
+        uint32_t ip_as_little_endian = fast_ntoh(subnet_as_integer);
+
+        // Increment it for specific number
+        ip_as_little_endian += i;
+
+        if (enable_connection_tracking) {
+            // On creating it initializes by zeros
+            conntrack_main_struct_t zero_conntrack_main_struct{};
+
+            SubnetVectorMapFlow[ip_as_little_endian] = zero_conntrack_main_struct;
+        }
+
+        uint32_t result_ip_as_big_endian = fast_hton(ip_as_little_endian);
+
+        // logger << log4cpp::Priority::INFO << "Allocate: " << convert_ip_as_uint_to_string(result_ip_as_big_endian);
+
+        // We use big endian values as keys
+        try {
+            ipv4_host_counters.average_speed_map[result_ip_as_big_endian] = zero_map_element;
+            ipv4_host_counters.counter_map[result_ip_as_big_endian] = zero_map_element;
+        } catch (std::bad_alloc& ba) {
+            logger << log4cpp::Priority::ERROR << "Can't allocate memory for hash counters";
+            exit(1);
+        }
     }
 
-    // Initilize map element
-    SubnetVectorMapFlow[current_subnet] = vector_of_flow_counters_t(network_size_in_ips);
-
-    // On creating it initializes by zeros
-    conntrack_main_struct_t zero_conntrack_main_struct;
-    std::fill(SubnetVectorMapFlow[current_subnet].begin(), SubnetVectorMapFlow[current_subnet].end(), zero_conntrack_main_struct);
-}
-
-void zeroify_all_counters() {
-    subnet_counter_t zero_map_element{};
-
-    for (map_of_vector_counters_t::iterator itr = SubnetVectorMap.begin(); itr != SubnetVectorMap.end(); ++itr) {
-        // logger<< log4cpp::Priority::INFO<<"Zeroify "<<itr->first;
-        std::fill(itr->second.begin(), itr->second.end(), zero_map_element);
-    }
+    logger << log4cpp::Priority::INFO << "Successfully allocated " << ipv4_host_counters.average_speed_map.size() << " counters";
 }
 
 bool load_our_networks_list() {
@@ -1225,10 +1227,6 @@ bool load_our_networks_list() {
         logger << log4cpp::Priority::INFO << "We loaded " << network_list_from_config.size() << " networks from networks file";
     }
 
-    // Some consistency checks
-    assert(convert_ip_as_string_to_uint("255.255.255.0") == convert_cidr_to_binary_netmask(24));
-    assert(convert_ip_as_string_to_uint("255.255.255.255") == convert_cidr_to_binary_netmask(32));
-
     logger << log4cpp::Priority::INFO << "Totally we have " << networks_list_ipv4_as_string.size() << " IPv4 subnets";
     logger << log4cpp::Priority::INFO << "Totally we have " << networks_list_ipv6_as_string.size() << " IPv6 subnets";
 
@@ -1249,7 +1247,15 @@ bool load_our_networks_list() {
         total_number_of_hosts_in_our_networks += pow(base, 32 - cidr_mask);
 
         // Make sure it's "subnet address" and not an host address
-        uint32_t subnet_address_as_uint        = convert_ip_as_string_to_uint(network_address);
+        uint32_t subnet_address_as_uint = 0;
+
+        bool ip_parser_result = convert_ip_as_string_to_uint_safe(network_address, subnet_address_as_uint);
+
+        if (!ip_parser_result) {
+            logger << log4cpp::Priority::ERROR << "Cannot parse " << network_address << " as IP";
+            continue;
+        }
+
         uint32_t subnet_address_netmask_binary = convert_cidr_to_binary_netmask(cidr_mask);
         uint32_t generated_subnet_address      = subnet_address_as_uint & subnet_address_netmask_binary;
 
@@ -1283,10 +1289,6 @@ bool load_our_networks_list() {
 
     /* Preallocate data structures */
     patricia_process(lookup_tree_ipv4, subnet_vectors_allocator);
-
-    logger << log4cpp::Priority::INFO << "We start total zerofication of counters";
-    zeroify_all_counters();
-    logger << log4cpp::Priority::INFO << "We finished zerofication";
 
     logger << log4cpp::Priority::INFO << "We loaded " << networks_list_ipv4_as_string.size()
            << " IPv4 subnets to our in-memory list of networks";
@@ -1409,7 +1411,7 @@ void init_logging(bool log_to_console) {
         logger.addAppender(appender);
     }
 
-    logger << log4cpp::Priority::INFO << "Logger initialized!";
+    logger << log4cpp::Priority::INFO << "Logger initialized";
 }
 
 void reconfigure_logging_level(const std::string& logging_level) {
@@ -1435,20 +1437,28 @@ void reconfigure_logging() {
     layout->setConversionPattern("[%p] %m%n");
 
     if (logging_configuration.local_syslog_logging) {
+#ifdef _WIN32
+        logger << log4cpp::Priority::ERROR << "Local syslog logging is not supported on Windows platform";
+#else
         log4cpp::Appender* local_syslog_appender = new log4cpp::SyslogAppender("fastnetmon", "fastnetmon", LOG_USER);
         local_syslog_appender->setLayout(layout);
         logger.addAppender(local_syslog_appender);
 
         logger << log4cpp::Priority::INFO << "We start local syslog logging corectly";
+#endif
     }
 
     if (logging_configuration.remote_syslog_logging) {
+#ifdef _WIN32
+        logger << log4cpp::Priority::ERROR << "Remote syslog logging is not supported on Windows platform";
+#else
         log4cpp::Appender* remote_syslog_appender =
             new log4cpp::RemoteSyslogAppender("fastnetmon", "fastnetmon", logging_configuration.remote_syslog_server,
                                               LOG_USER, logging_configuration.remote_syslog_port);
 
         remote_syslog_appender->setLayout(layout);
         logger.addAppender(remote_syslog_appender);
+#endif
 
         logger << log4cpp::Priority::INFO << "We start remote syslog logging correctly";
     }
@@ -1456,7 +1466,10 @@ void reconfigure_logging() {
     reconfigure_logging_level(logging_configuration.logging_level);
 }
 
+
+#ifndef _WIN32
 // Call fork function
+// We have no work on Windows
 int do_fork() {
     int status = 0;
 
@@ -1476,6 +1489,7 @@ int do_fork() {
 
     return status;
 }
+#endif
 
 
 void redirect_fds() {
@@ -1503,7 +1517,7 @@ void redirect_fds() {
 // Handles fatal failure of FastNetMon's daemon
 void fatal_signal_handler(int signum) {
     ::signal(signum, SIG_DFL);
-    boost::stacktrace::safe_dump_to(backtrace_path.c_str());
+    boost::stacktrace::safe_dump_to(fastnetmon_platform_configuration.backtrace_path.c_str());
     ::raise(SIGABRT);
 }
 
@@ -1516,8 +1530,8 @@ int main(int argc, char** argv) {
     // Switch logging to console
     bool log_to_console = false;
 
-    // By default we do PID checks
-    bool do_pid_checks = true;
+    // This was legacy logic for init V based distros to prevent multiple copies of same daemon running in same time
+    bool do_pid_checks = false;
 
     try {
         // clang-format off
@@ -1530,7 +1544,8 @@ int main(int argc, char** argv) {
 		("configuration_file", po::value<std::string>(),"set path to custom configuration file")
 		("log_file", po::value<std::string>(), "set path to custom log file")
         ("log_to_console", "switches all logging to console")
-        ("disable_pid_logic", "Disables logic which stores PID to file and uses it for duplicate instance checks");
+        ("pid_logic", "Enables logic which stores PID to file and uses it for duplicate instance checks")
+        ("disable_pid_logic", "Disables logic which stores PID to file and uses it for duplicate instance checks. No op as it's disabled by default");
         // clang-format on
 
         po::variables_map vm;
@@ -1571,8 +1586,13 @@ int main(int argc, char** argv) {
             log_to_console = true;
         }
 
+        // No op as it's disabled by default
         if (vm.count("disable_pid_logic")) {
             do_pid_checks = false;
+        }
+
+        if (vm.count("pid_logic")) {
+            do_pid_checks = true;
         }
     } catch (po::error& e) {
         std::cerr << "ERROR: " << e.what() << std::endl << std::endl;
@@ -1580,11 +1600,11 @@ int main(int argc, char** argv) {
     }
 
     // We use ideas from here https://github.com/bmc/daemonize/blob/master/daemon.c
-
+#ifndef _WIN32
     if (daemonize) {
         int status = 0;
 
-        printf("We will run in daemonized mode\n");
+        std::cout << "We will run in daemonized mode" << std::endl;
 
         if ((status = do_fork()) < 0) {
             // fork failed
@@ -1609,9 +1629,18 @@ int main(int argc, char** argv) {
             redirect_fds();
         }
     }
+#else
+    if (daemonize) {
+        std::cerr << "ERROR: " << "Daemon mode is not supported on Windows platforms" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+#endif
 
-    // enable core dumps
+
+    // Enable core dumps
+#ifndef _WIN32
     enable_core_dumps();
+#endif
 
     // Setup fatal signal handlers to gracefully capture them
     ::signal(SIGSEGV, &fatal_signal_handler);
@@ -1619,9 +1648,9 @@ int main(int argc, char** argv) {
 
     init_logging(log_to_console);
 
-    if (std::filesystem::exists(backtrace_path)) {
+    if (std::filesystem::exists(fastnetmon_platform_configuration.backtrace_path)) {
         // there is a backtrace
-        std::ifstream ifs(backtrace_path);
+        std::ifstream ifs(fastnetmon_platform_configuration.backtrace_path);
 
         boost::stacktrace::stacktrace st = boost::stacktrace::stacktrace::from_dump(ifs);
         logger << log4cpp::Priority::ERROR << "Previous run crashed, you can find stack trace below";
@@ -1629,7 +1658,7 @@ int main(int argc, char** argv) {
 
         // cleaning up
         ifs.close();
-        std::filesystem::remove(backtrace_path);
+        std::filesystem::remove(fastnetmon_platform_configuration.backtrace_path);
     }
 
 #ifdef FASTNETMON_API
@@ -1653,6 +1682,14 @@ int main(int argc, char** argv) {
         exit(0);
     }
 
+    // On Linux and FreeBSD platforms we use kill to check that process with specific PID is alive
+    // Unfortunately, it's way more tricky to implement such approach on Windows and we decided just to disable this logic 
+#ifdef _WIN32
+    if (do_pid_checks) {
+        logger << log4cpp::Priority::INFO << "PID logic is not available on Windows";
+        exit(1);
+    }
+#else
     if (do_pid_checks && file_exists(fastnetmon_platform_configuration.pid_path)) {
         pid_t pid_from_file = 0;
 
@@ -1689,6 +1726,7 @@ int main(int argc, char** argv) {
             exit(EXIT_FAILURE);
         }
     }
+#endif
 
     lookup_tree_ipv4    = New_Patricia(32);
     whitelist_tree_ipv4 = New_Patricia(32);
@@ -1723,6 +1761,9 @@ int main(int argc, char** argv) {
 
     load_our_networks_list();
 
+    // We should specify size of circular buffers here
+    packet_buckets_ipv4_storage.set_buffers_capacity(ban_details_records_count);
+
     // Set capacity for nested buffers
     packet_buckets_ipv6_storage.set_buffers_capacity(ban_details_records_count);
 
@@ -1732,11 +1773,14 @@ int main(int argc, char** argv) {
         exit(1);
     }
 
+    // Windows does not support SIGPIPE
+#ifndef _WIN32
     /* Without this SIGPIPE error could shutdown toolkit on call of exec_with_stdin_params */
     if (signal(SIGPIPE, sigpipe_handler_for_popen) == SIG_ERR) {
         logger << log4cpp::Priority::ERROR << "Can't setup SIGPIPE handler";
         exit(1);
     }
+#endif
 
 #ifdef GEOIP
     // Init GeoIP
@@ -1882,9 +1926,11 @@ int main(int argc, char** argv) {
         packet_capture_plugin_thread_group.add_thread(new boost::thread(start_netflow_collection, process_packet));
     }
 
+#ifdef ENABLE_PCAP
     if (enable_pcap_collection) {
         packet_capture_plugin_thread_group.add_thread(new boost::thread(start_pcap_collection, process_packet));
     }
+#endif
 
     // Wait for all threads in capture thread group
     packet_capture_plugin_thread_group.join_all();

@@ -1,20 +1,24 @@
-#include <inttypes.h>
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-
 #include <map>
 #include <string>
 
+#include "../fastnetmon_plugin.hpp"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <net/if_arp.h> // struct arphdr
 #include <netinet/if_ether.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+
+#endif
+
 #include <pcap.h>
 
 #include "../all_logcpp_libraries.hpp"
@@ -109,6 +113,8 @@ void parse_packet(u_char* user, struct pcap_pkthdr* packethdr, const u_char* pac
     unsigned int packet_length = ntohs(iphdr->ip_len);
 
     simple_packet_t current_packet;
+    current_packet.source       = MIRROR;
+    current_packet.arrival_time = current_inaccurate_time;
 
     // Advance to the transport layer header then parse and display
     // the fields based on the type of hearder: tcp, udp or icmp

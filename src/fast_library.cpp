@@ -1,20 +1,16 @@
 #include "fast_library.hpp"
-#include <arpa/inet.h>
 #include <fstream>
 #include <iostream>
-#include <net/if.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <stdint.h>
-#include <stdlib.h> // atoi
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
+// Windows does not use ioctl
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#endif
+
+#ifndef _WIN32
 // For uname function
 #include <sys/utsname.h>
+#endif
 
 #include "all_logcpp_libraries.hpp"
 
@@ -35,6 +31,9 @@
 #include <capnp/serialize-packed.h>
 #endif
 
+#include <boost/algorithm/string.hpp>
+#include <boost/regex.hpp>
+
 boost::regex regular_expression_cidr_pattern("^\\d+\\.\\d+\\.\\d+\\.\\d+\\/\\d+$");
 boost::regex regular_expression_host_pattern("^\\d+\\.\\d+\\.\\d+\\.\\d+$");
 
@@ -43,19 +42,20 @@ int convert_string_to_integer(std::string line) {
     return atoi(line.c_str());
 }
 
-uint32_t convert_ip_as_string_to_uint(std::string ip) {
-    struct in_addr ip_addr;
-    inet_aton(ip.c_str(), &ip_addr);
-
-    // in network byte order
-    return ip_addr.s_addr;
-}
-
 std::string convert_ip_as_uint_to_string(uint32_t ip_as_integer) {
     struct in_addr ip_addr;
     ip_addr.s_addr = ip_as_integer;
     return (std::string)inet_ntoa(ip_addr);
 }
+
+std::string convert_ipv4_subnet_to_string(const subnet_cidr_mask_t& subnet) {
+    std::stringstream buffer;
+
+    buffer << convert_ip_as_uint_to_string(subnet.subnet_address) << "/" << subnet.cidr_prefix_length;
+
+    return buffer.str();
+}
+
 
 // convert integer to string
 std::string convert_int_to_string(int value) {
@@ -65,43 +65,44 @@ std::string convert_int_to_string(int value) {
     return out.str();
 }
 
-// BE AWARE! WE USE NON STANDARD SUBNET_T HERE! WE USE NON CIDR MASK HERE!
-subnet_cidr_mask_t convert_subnet_from_string_to_binary(std::string subnet_cidr) {
+// Converts IP address in cidr form 11.22.33.44/24 to our representation
+bool convert_subnet_from_string_to_binary_with_cidr_format_safe(const std::string& subnet_cidr, subnet_cidr_mask_t& subnet_cidr_mask) {
+    if (subnet_cidr.empty()) {
+        return false;
+    }
+
+    // It's not a cidr mask
+    if (!is_cidr_subnet(subnet_cidr)) {
+        return false;
+    }
+
     std::vector<std::string> subnet_as_string;
+
     split(subnet_as_string, subnet_cidr, boost::is_any_of("/"), boost::token_compress_on);
 
-    unsigned int cidr = convert_string_to_integer(subnet_as_string[1]);
-
-    uint32_t subnet_as_int = convert_ip_as_string_to_uint(subnet_as_string[0]);
-
-    return subnet_cidr_mask_t(subnet_as_int, cidr);
-}
-
-// TODO: very bad code without result checks!!! Get rid all functions which are using it
-// But this code is pretty handy in tests code
-subnet_cidr_mask_t convert_subnet_from_string_to_binary_with_cidr_format(std::string subnet_cidr) {
-    std::vector<std::string> subnet_as_string;
-    split(subnet_as_string, subnet_cidr, boost::is_any_of("/"), boost::token_compress_on);
-
-    // Return zero subnet in this case
     if (subnet_as_string.size() != 2) {
-        return subnet_cidr_mask_t();
+        return false;
     }
 
-    unsigned int cidr = convert_string_to_integer(subnet_as_string[1]);
+    uint32_t subnet_as_int = 0;
 
-    uint32_t subnet_as_int = convert_ip_as_string_to_uint(subnet_as_string[0]);
+    bool ip_to_integer_convresion_result = convert_ip_as_string_to_uint_safe(subnet_as_string[0], subnet_as_int);
 
-    return subnet_cidr_mask_t(subnet_as_int, cidr);
-}
-
-void copy_networks_from_string_form_to_binary(std::vector<std::string> networks_list_as_string,
-                                              std::vector<subnet_cidr_mask_t>& our_networks) {
-    for (std::vector<std::string>::iterator ii = networks_list_as_string.begin(); ii != networks_list_as_string.end(); ++ii) {
-
-        subnet_cidr_mask_t current_subnet = convert_subnet_from_string_to_binary(*ii);
-        our_networks.push_back(current_subnet);
+    if (!ip_to_integer_convresion_result) {
+        return false;
     }
+
+    int cidr = 0;
+
+    bool ip_conversion_result = convert_string_to_any_integer_safe(subnet_as_string[1], cidr);
+
+    if (!ip_conversion_result) {
+        return false;
+    }
+
+    subnet_cidr_mask = subnet_cidr_mask_t(subnet_as_int, cidr);
+
+    return true;
 }
 
 std::string convert_subnet_to_string(subnet_cidr_mask_t my_subnet) {
@@ -222,65 +223,6 @@ bool folder_exists(std::string path) {
     }
 
     return false;
-}
-
-#define BIG_CONSTANT(x) (x##LLU)
-
-/*
-
-    // calculate hash
-    unsigned int seed = 11;
-    uint64_t hash = MurmurHash64A(&current_packet, sizeof(current_packet), seed);
-
-*/
-
-// https://code.google.com/p/smhasher/source/browse/trunk/MurmurHash2.cpp
-// 64-bit hash for 64-bit platforms
-uint64_t MurmurHash64A(const void* key, int len, uint64_t seed) {
-    const uint64_t m = BIG_CONSTANT(0xc6a4a7935bd1e995);
-    const int r      = 47;
-
-    uint64_t h = seed ^ (len * m);
-
-    const uint64_t* data = (const uint64_t*)key;
-    const uint64_t* end  = data + (len / 8);
-
-    while (data != end) {
-        uint64_t k = *data++;
-
-        k *= m;
-        k ^= k >> r;
-        k *= m;
-
-        h ^= k;
-        h *= m;
-    }
-
-    const unsigned char* data2 = (const unsigned char*)data;
-
-    switch (len & 7) {
-    case 7:
-        h ^= uint64_t(data2[6]) << 48;
-    case 6:
-        h ^= uint64_t(data2[5]) << 40;
-    case 5:
-        h ^= uint64_t(data2[4]) << 32;
-    case 4:
-        h ^= uint64_t(data2[3]) << 24;
-    case 3:
-        h ^= uint64_t(data2[2]) << 16;
-    case 2:
-        h ^= uint64_t(data2[1]) << 8;
-    case 1:
-        h ^= uint64_t(data2[0]);
-        h *= m;
-    };
-
-    h ^= h >> r;
-    h *= m;
-    h ^= h >> r;
-
-    return h;
 }
 
 // http://www.gnu.org/software/libc/manual/html_node/Elapsed-Time.html
@@ -452,6 +394,8 @@ bool serialize_simple_packet_to_json(const simple_packet_t& packet, nlohmann::js
     }
 
     try {
+        // We use arrival_time as traffic telemetry protocols do not provide this time in a reliable manner
+        json_packet["timestamp"] = packet.arrival_time;
 
         json_packet["ip_version"] = protocol_version;
 
@@ -721,13 +665,13 @@ interfaces_list_t get_interfaces_list() {
 }
 
 // Get all IPs for interface: main IP and aliases
-ip_addresses_list_t get_ip_list_for_interface(std::string interface) {
+ip_addresses_list_t get_ip_list_for_interface(const std::string& interface_name) {
     ip_addresses_list_t ip_list;
 
     std::string error_text;
     std::vector<std::string> output_list;
 
-    bool exec_result = exec("ip address show dev " + interface, output_list, error_text);
+    bool exec_result = exec("ip address show dev " + interface_name, output_list, error_text);
 
     if (!exec_result) {
         return ip_list;
@@ -790,28 +734,21 @@ std::string convert_prefix_to_string_representation(prefix_t* prefix) {
     return address + "/" + convert_int_to_string(prefix->bitlen);
 }
 
-std::string find_subnet_by_ip_in_string_format(patricia_tree_t* patricia_tree, std::string ip) {
-    patricia_node_t* found_patrica_node = NULL;
-
-    // Convert IP to integer
-    uint32_t client_ip = convert_ip_as_string_to_uint(ip);
-
-    prefix_t prefix_for_check_adreess;
-    prefix_for_check_adreess.add.sin.s_addr = client_ip;
-    prefix_for_check_adreess.family         = AF_INET;
-    prefix_for_check_adreess.bitlen         = 32;
-
-    found_patrica_node = patricia_search_best2(patricia_tree, &prefix_for_check_adreess, 1);
-
-    if (found_patrica_node != NULL) {
-        return convert_prefix_to_string_representation(found_patrica_node->prefix);
-    } else {
-        return "";
-    }
-}
-
 // It could not be on start or end of the line
 boost::regex ipv6_address_compression_algorithm("(0000:){2,}");
+
+// Returns true when all octets of IP address are set to zero
+bool is_zero_ipv6_address(const in6_addr& ipv6_address) {
+    const uint8_t* b = ipv6_address.s6_addr;
+
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+        b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 && b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 
 std::string print_ipv6_address(const in6_addr& ipv6_address) {
     char buffer[128];
@@ -960,7 +897,6 @@ std::string get_direction_name(direction_t direction_value) {
     return direction_name;
 }
 
-// We haven't this code for FreeBSD yet
 #ifdef __linux__
 bool manage_interface_promisc_mode(std::string interface_name, bool switch_on) {
     extern log4cpp::Category& logger;
@@ -1025,7 +961,7 @@ bool manage_interface_promisc_mode(std::string interface_name, bool switch_on) {
 
 #endif
 
-std::string serialize_attack_description(attack_details_t& current_attack) {
+std::string serialize_attack_description(const attack_details_t& current_attack) {
     std::stringstream attack_description;
 
     attack_type_t attack_type         = detect_attack_type(current_attack);
@@ -1037,77 +973,84 @@ std::string serialize_attack_description(attack_details_t& current_attack) {
                        << "Attack direction: " << get_direction_name(current_attack.attack_direction) << "\n"
                        << "Attack protocol: " << get_printable_protocol_name(current_attack.attack_protocol) << "\n";
 
-    attack_description << "Total incoming traffic: " << convert_speed_to_mbps(current_attack.total.in_bytes) << " mbps\n"
-                       << "Total outgoing traffic: " << convert_speed_to_mbps(current_attack.total.out_bytes) << " mbps\n"
-                       << "Total incoming pps: " << current_attack.total.in_packets << " packets per second\n"
-                       << "Total outgoing pps: " << current_attack.total.out_packets << " packets per second\n"
-                       << "Total incoming flows: " << current_attack.in_flows << " flows per second\n"
-                       << "Total outgoing flows: " << current_attack.out_flows << " flows per second\n";
-
-
-    // Add average counters
-    attack_description << "Average incoming traffic: " << convert_speed_to_mbps(current_attack.average_in_bytes) << " mbps\n"
-                       << "Average outgoing traffic: " << convert_speed_to_mbps(current_attack.average_out_bytes) << " mbps\n"
-                       << "Average incoming pps: " << current_attack.average_in_packets << " packets per second\n"
-                       << "Average outgoing pps: " << current_attack.average_out_packets << " packets per second\n"
-                       << "Average incoming flows: " << current_attack.average_in_flows << " flows per second\n"
-                       << "Average outgoing flows: " << current_attack.average_out_flows << " flows per second\n";
+    attack_description
+        << "Total incoming traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.total.in_bytes) << " mbps\n"
+        << "Total outgoing traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.total.out_bytes) << " mbps\n"
+        << "Total incoming pps: " << current_attack.traffic_counters.total.in_packets << " packets per second\n"
+        << "Total outgoing pps: " << current_attack.traffic_counters.total.out_packets << " packets per second\n"
+        << "Total incoming flows: " << current_attack.traffic_counters.in_flows << " flows per second\n"
+        << "Total outgoing flows: " << current_attack.traffic_counters.out_flows << " flows per second\n";
 
     attack_description
-        << "Incoming ip fragmented traffic: " << convert_speed_to_mbps(current_attack.fragmented.in_bytes) << " mbps\n"
-        << "Outgoing ip fragmented traffic: " << convert_speed_to_mbps(current_attack.fragmented.out_bytes) << " mbps\n"
-        << "Incoming ip fragmented pps: " << current_attack.fragmented.in_packets << " packets per second\n"
-        << "Outgoing ip fragmented pps: " << current_attack.fragmented.out_packets << " packets per second\n"
+        << "Incoming ip fragmented traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.fragmented.in_bytes) << " mbps\n"
+        << "Outgoing ip fragmented traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.fragmented.out_bytes)
+        << " mbps\n"
+        << "Incoming ip fragmented pps: " << current_attack.traffic_counters.fragmented.in_packets << " packets per second\n"
+        << "Outgoing ip fragmented pps: " << current_attack.traffic_counters.fragmented.out_packets << " packets per second\n"
 
-        << "Incoming tcp traffic: " << convert_speed_to_mbps(current_attack.tcp.in_bytes) << " mbps\n"
-        << "Outgoing tcp traffic: " << convert_speed_to_mbps(current_attack.tcp.out_bytes) << " mbps\n"
-        << "Incoming tcp pps: " << current_attack.tcp.in_packets << " packets per second\n"
-        << "Outgoing tcp pps: " << current_attack.tcp.out_packets << " packets per second\n"
-        << "Incoming syn tcp traffic: " << convert_speed_to_mbps(current_attack.tcp_syn.in_bytes) << " mbps\n"
-        << "Outgoing syn tcp traffic: " << convert_speed_to_mbps(current_attack.tcp_syn.out_bytes) << " mbps\n"
-        << "Incoming syn tcp pps: " << current_attack.tcp_syn.in_packets << " packets per second\n"
-        << "Outgoing syn tcp pps: " << current_attack.tcp_syn.out_packets << " packets per second\n"
+        << "Incoming dropped traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.dropped.in_bytes) << " mbps\n"
+        << "Outgoing dropped traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.dropped.out_bytes) << " mbps\n"
+        << "Incoming dropped pps: " << current_attack.traffic_counters.dropped.in_packets << " packets per second\n"
+        << "Outgoing dropped pps: " << current_attack.traffic_counters.dropped.out_packets << " packets per second\n"
 
-        << "Incoming udp traffic: " << convert_speed_to_mbps(current_attack.udp.in_bytes) << " mbps\n"
-        << "Outgoing udp traffic: " << convert_speed_to_mbps(current_attack.udp.out_bytes) << " mbps\n"
-        << "Incoming udp pps: " << current_attack.udp.in_packets << " packets per second\n"
-        << "Outgoing udp pps: " << current_attack.udp.out_packets << " packets per second\n"
+        << "Incoming tcp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.tcp.in_bytes) << " mbps\n"
+        << "Outgoing tcp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.tcp.out_bytes) << " mbps\n"
+        << "Incoming tcp pps: " << current_attack.traffic_counters.tcp.in_packets << " packets per second\n"
+        << "Outgoing tcp pps: " << current_attack.traffic_counters.tcp.out_packets << " packets per second\n"
+        << "Incoming syn tcp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.tcp_syn.in_bytes) << " mbps\n"
+        << "Outgoing syn tcp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.tcp_syn.out_bytes) << " mbps\n"
+        << "Incoming syn tcp pps: " << current_attack.traffic_counters.tcp_syn.in_packets << " packets per second\n"
+        << "Outgoing syn tcp pps: " << current_attack.traffic_counters.tcp_syn.out_packets << " packets per second\n"
 
-        << "Incoming icmp traffic: " << convert_speed_to_mbps(current_attack.icmp.in_bytes) << " mbps\n"
-        << "Outgoing icmp traffic: " << convert_speed_to_mbps(current_attack.icmp.out_bytes) << " mbps\n"
-        << "Incoming icmp pps: " << current_attack.icmp.in_packets << " packets per second\n"
-        << "Outgoing icmp pps: " << current_attack.icmp.out_packets << " packets per second\n";
+        << "Incoming udp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.udp.in_bytes) << " mbps\n"
+        << "Outgoing udp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.udp.out_bytes) << " mbps\n"
+        << "Incoming udp pps: " << current_attack.traffic_counters.udp.in_packets << " packets per second\n"
+        << "Outgoing udp pps: " << current_attack.traffic_counters.udp.out_packets << " packets per second\n"
+
+        << "Incoming icmp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.icmp.in_bytes) << " mbps\n"
+        << "Outgoing icmp traffic: " << convert_speed_to_mbps(current_attack.traffic_counters.icmp.out_bytes) << " mbps\n"
+        << "Incoming icmp pps: " << current_attack.traffic_counters.icmp.in_packets << " packets per second\n"
+        << "Outgoing icmp pps: " << current_attack.traffic_counters.icmp.out_packets << " packets per second\n";
+
 
     return attack_description.str();
 }
 
-attack_type_t detect_attack_type(attack_details_t& current_attack) {
+attack_type_t detect_attack_type(const attack_details_t& current_attack) {
     double threshold_value = 0.9;
 
     if (current_attack.attack_direction == INCOMING) {
-        if (current_attack.tcp_syn.in_packets > threshold_value * current_attack.total.in_packets) {
+        if (current_attack.traffic_counters.tcp_syn.in_packets > threshold_value * current_attack.traffic_counters.total.in_packets) {
             return ATTACK_SYN_FLOOD;
-        } else if (current_attack.icmp.in_packets > threshold_value * current_attack.total.in_packets) {
+        } else if (current_attack.traffic_counters.icmp.in_packets >
+                   threshold_value * current_attack.traffic_counters.total.in_packets) {
             return ATTACK_ICMP_FLOOD;
-        } else if (current_attack.fragmented.in_packets > threshold_value * current_attack.total.in_packets) {
+        } else if (current_attack.traffic_counters.fragmented.in_packets >
+                   threshold_value * current_attack.traffic_counters.total.in_packets) {
             return ATTACK_IP_FRAGMENTATION_FLOOD;
-        } else if (current_attack.udp.in_packets > threshold_value * current_attack.total.in_packets) {
+        } else if (current_attack.traffic_counters.udp.in_packets >
+                   threshold_value * current_attack.traffic_counters.total.in_packets) {
             return ATTACK_UDP_FLOOD;
         }
     } else if (current_attack.attack_direction == OUTGOING) {
-        if (current_attack.tcp_syn.out_packets > threshold_value * current_attack.total.out_packets) {
+        if (current_attack.traffic_counters.tcp_syn.out_packets >
+            threshold_value * current_attack.traffic_counters.total.out_packets) {
             return ATTACK_SYN_FLOOD;
-        } else if (current_attack.icmp.out_packets > threshold_value * current_attack.total.out_packets) {
+        } else if (current_attack.traffic_counters.icmp.out_packets >
+                   threshold_value * current_attack.traffic_counters.total.out_packets) {
             return ATTACK_ICMP_FLOOD;
-        } else if (current_attack.fragmented.out_packets > threshold_value * current_attack.total.out_packets) {
+        } else if (current_attack.traffic_counters.fragmented.out_packets >
+                   threshold_value * current_attack.traffic_counters.total.out_packets) {
             return ATTACK_IP_FRAGMENTATION_FLOOD;
-        } else if (current_attack.udp.out_packets > threshold_value * current_attack.total.out_packets) {
+        } else if (current_attack.traffic_counters.udp.out_packets >
+                   threshold_value * current_attack.traffic_counters.total.out_packets) {
             return ATTACK_UDP_FLOOD;
         }
     }
 
     return ATTACK_UNKNOWN;
 }
+
 
 std::string get_printable_attack_name(attack_type_t attack) {
     if (attack == ATTACK_SYN_FLOOD) {
@@ -1140,30 +1083,6 @@ std::string serialize_network_load_to_text(subnet_counter_t& network_speed_meter
            << prefix << " outgoing pps: " << network_speed_meter.total.out_packets << " packets per second\n";
 
     return buffer.str();
-}
-
-std::string serialize_statistic_counters_about_attack(attack_details_t& current_attack) {
-    std::stringstream attack_description;
-
-    double average_packet_size_for_incoming_traffic = 0;
-    double average_packet_size_for_outgoing_traffic = 0;
-
-    if (current_attack.average_in_packets > 0) {
-        average_packet_size_for_incoming_traffic = (double)current_attack.average_in_bytes / (double)current_attack.average_in_packets;
-    }
-
-    if (current_attack.average_out_packets > 0) {
-        average_packet_size_for_outgoing_traffic = (double)current_attack.average_out_bytes / (double)current_attack.average_out_packets;
-    }
-
-    // We do not need very accurate size
-    attack_description.precision(1);
-    attack_description << "Average packet size for incoming traffic: " << std::fixed
-                       << average_packet_size_for_incoming_traffic << " bytes \n"
-                       << "Average packet size for outgoing traffic: " << std::fixed
-                       << average_packet_size_for_outgoing_traffic << " bytes \n";
-
-    return attack_description.str();
 }
 
 std::string dns_lookup(std::string domain_name) {
@@ -1232,6 +1151,9 @@ bool convert_hex_as_string_to_uint(std::string hex, uint32_t& value) {
     return ss.fail();
 }
 
+
+#ifdef __linux__
+// We use this logic only from AF_PACKET and we clearly have no reasons to maintain cross platform portability for it
 // Get interface number by name
 bool get_interface_number_by_device_name(int socket_fd, std::string interface_name, int& interface_number) {
     struct ifreq ifr;
@@ -1243,32 +1165,21 @@ bool get_interface_number_by_device_name(int socket_fd, std::string interface_na
 
     strncpy(ifr.ifr_name, interface_name.c_str(), sizeof(ifr.ifr_name));
 
-/* Attempt to use SIOCGIFINDEX if present. */
-#ifdef SIOCGIFINDEX
     if (ioctl(socket_fd, SIOCGIFINDEX, &ifr) == -1) {
         return false;
     }
 
-#ifdef __FreeBSD__
-    interface_number = ifr.ifr_ifru.ifru_index;
-#else
     interface_number = ifr.ifr_ifindex;
-#endif
-
-#else
-    /* Fallback to if_nametoindex(3) otherwise. */
-    interface_number = if_nametoindex(interface_name.c_str());
-    if (interface_number == 0) return false;
-#endif /* SIOCGIFINDEX */
     return true;
 }
 
+#endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 bool set_boost_process_name(boost::thread* thread, const std::string& process_name) {
     extern log4cpp::Category& logger;
 
-    logger << log4cpp::Priority::ERROR << "Apple platforms do not support thread name changes";
+    logger << log4cpp::Priority::ERROR << "We do not support custom thread names on this platform";
     return false;
 }
 
@@ -1359,11 +1270,11 @@ bool read_simple_packet(uint8_t* buffer, size_t buffer_length, simple_packet_t& 
         packet.ip_fragmented              = root.getIpFragmented();
         packet.ts.tv_sec                  = root.getTsSec();
         packet.ts.tv_usec                 = root.getTsMsec();
-        packet.packet_payload_length      = root.getPacketPayloadLength();
-        packet.packet_payload_full_length = root.getPacketPayloadFullLength();
+        packet.captured_payload_length      = root.getPacketPayloadLength();
+        packet.payload_full_length = root.getPacketPayloadFullLength();
         packet.packet_direction           = (direction_t)root.getPacketDirection();
         packet.source                     = (source_t)root.getSource();
-    } catch (kj::Exception e) {
+    } catch (kj::Exception& e) {
         logger << log4cpp::Priority::WARN
                << "Exception happened during attempt to parse tera flow packet: " << e.getDescription().cStr();
         return false;
@@ -1396,8 +1307,8 @@ bool write_simple_packet(int fd, simple_packet_t& packet, bool populate_ipv6) {
     capnp_packet.setIpFragmented(packet.ip_fragmented);
     capnp_packet.setTsSec(packet.ts.tv_sec);
     capnp_packet.setTsMsec(packet.ts.tv_usec);
-    capnp_packet.setPacketPayloadLength(packet.packet_payload_length);
-    capnp_packet.setPacketPayloadFullLength(packet.packet_payload_full_length);
+    capnp_packet.setPacketPayloadLength(packet.captured_payload_length);
+    capnp_packet.setPacketPayloadFullLength(packet.payload_full_length);
     capnp_packet.setPacketDirection(packet.packet_direction);
     capnp_packet.setSource(packet.source);
     capnp_packet.setSrcAsn(packet.src_asn);
@@ -1456,8 +1367,8 @@ std::string print_ipv6_cidr_subnet(subnet_ipv6_cidr_mask_t subnet) {
 }
 
 // Abstract function with overloads for templated classes where we use v4 and v4
-std::string convert_any_ip_to_string(subnet_ipv6_cidr_mask_t subnet) {
-    return print_ipv6_cidr_subnet(subnet);
+std::string convert_any_ip_to_string(const subnet_ipv6_cidr_mask_t& subnet) {
+    return convert_ipv6_subnet_to_string(subnet);
 }
 
 // Return true if we have this IP in patricia tree
@@ -1928,7 +1839,7 @@ uint64_t get_current_unix_time_in_nanoseconds() {
 }
 
 // Joins data to format a=b,d=f
-std::string join_by_comma_and_equal(std::map<std::string, std::string>& data) {
+std::string join_by_comma_and_equal(const std::map<std::string, std::string>& data) {
     std::stringstream buffer;
 
     for (auto itr = data.begin(); itr != data.end(); ++itr) {
@@ -2231,6 +2142,12 @@ std::string get_virtualisation_method() {
     return boost::algorithm::to_lower_copy(output[0]);
 }
 
+#ifdef _WIN32
+bool get_kernel_version(std::string& kernel_version) {
+    kernel_version = "windows";
+    return true;
+}
+#else
 // Get linux kernel version in form: 3.19.0-25-generic
 bool get_kernel_version(std::string& kernel_version) {
     struct utsname current_utsname;
@@ -2246,6 +2163,7 @@ bool get_kernel_version(std::string& kernel_version) {
 
     return true;
 }
+#endif
 
 // Returns all CPU flags in vector
 bool get_cpu_flags(std::vector<std::string>& flags) {
@@ -2365,6 +2283,23 @@ std::string country_static_string_to_dynamic_string(const boost::beast::static_s
     return country_code_dynamic_string;
 }
 
+#ifdef _WIN32
+// We have no inet_aton on Windows but we do have inet_pton https://learn.microsoft.com/en-us/windows/win32/api/ws2tcpip/nf-ws2tcpip-inet_pton
+// Convert IP in string representation to uint32_t in big endian (network byte order)
+// I think we can switch to using pton for Linux and other *nix too but we need to do careful testing including performance evaluation before
+bool convert_ip_as_string_to_uint_safe(const std::string& ip, uint32_t& ip_as_integer) {
+    struct in_addr ip_addr;
+
+    // Both Windows and Linux return 1 in case of success
+    if (inet_pton(AF_INET, ip.c_str(), &ip_addr) != 1) {
+        return false;
+    }
+
+    // in network byte order
+    ip_as_integer = ip_addr.s_addr;
+    return true;
+}
+#else
 // Convert IP in string representation to uint32_t in big endian (network byte order)
 bool convert_ip_as_string_to_uint_safe(const std::string& ip, uint32_t& ip_as_integer) {
     struct in_addr ip_addr;
@@ -2379,3 +2314,154 @@ bool convert_ip_as_string_to_uint_safe(const std::string& ip, uint32_t& ip_as_in
     ip_as_integer = ip_addr.s_addr;
     return true;
 }
+#endif
+
+forwarding_status_t forwarding_status_from_integer(uint8_t forwarding_status_as_integer) {
+    // Decode numbers into forwarding statuses
+    // I think they're same for Netflow v9 https://www.cisco.com/en/US/technologies/tk648/tk362/technologies_white_paper09186a00800a3db9.html
+    // and IPFIX: https://datatracker.ietf.org/doc/html/rfc7270#section-4.12
+    if (forwarding_status_as_integer == 0) {
+        return forwarding_status_t::unknown;
+    } else if (forwarding_status_as_integer == 1) {
+        return forwarding_status_t::forwarded;
+    } else if (forwarding_status_as_integer == 2) {
+        return forwarding_status_t::dropped;
+    } else if (forwarding_status_as_integer == 3) {
+        return forwarding_status_t::consumed;
+    } else {
+        // It must not happen
+        return forwarding_status_t::unknown;
+    }
+}
+
+// Represent IPv6 subnet in string form
+std::string convert_ipv6_subnet_to_string(const subnet_ipv6_cidr_mask_t& subnet) {
+    return print_ipv6_address(subnet.subnet_address) + "/" + std::to_string(subnet.cidr_prefix_length);
+}
+
+std::string convert_any_ip_to_string(uint32_t client_ip) {
+    return convert_ip_as_uint_to_string(client_ip);
+}
+
+// This code lookup IP in specified patricia tree and returns prefix which it
+// belongs
+bool lookup_ip_in_integer_form_inpatricia_and_return_subnet_if_found(patricia_tree_t* patricia_tree,
+                                                                     uint32_t client_ip,
+                                                                     subnet_cidr_mask_t& subnet) {
+    if (patricia_tree == NULL) {
+        return false;
+    }
+
+    prefix_t prefix_for_check_address;
+    prefix_for_check_address.add.sin.s_addr = client_ip;
+    prefix_for_check_address.family         = AF_INET;
+    prefix_for_check_address.bitlen         = 32;
+
+    patricia_node_t* found_patrica_node = patricia_search_best2(patricia_tree, &prefix_for_check_address, 1);
+
+    if (found_patrica_node == NULL) {
+        return false;
+    }
+
+    prefix_t* prefix = found_patrica_node->prefix;
+
+    if (prefix == NULL) {
+        return false;
+    }
+
+    subnet.subnet_address     = prefix->add.sin.s_addr;
+    subnet.cidr_prefix_length = prefix->bitlen;
+
+    return true;
+}
+
+// Return true if we have this IP in patricia tree
+bool ip_belongs_to_patricia_tree(patricia_tree_t* patricia_tree, uint32_t client_ip) {
+    prefix_t prefix_for_check_address;
+    prefix_for_check_address.add.sin.s_addr = client_ip;
+    prefix_for_check_address.family         = AF_INET;
+    prefix_for_check_address.bitlen         = 32;
+
+    return patricia_search_best2(patricia_tree, &prefix_for_check_address, 1) != NULL;
+}
+
+// Overloaded function which works with any IP protocol version, we use it for templated applications
+std::string convert_any_subnet_to_string(const subnet_ipv6_cidr_mask_t& subnet) {
+    return convert_ipv6_subnet_to_string(subnet);
+}
+
+std::string convert_any_subnet_to_string(const subnet_cidr_mask_t& subnet) {
+    return convert_ipv4_subnet_to_string(subnet);
+}
+
+std::string print_binary_string_as_hex_with_leading_0x(const uint8_t* data_ptr, uint32_t data_length) {
+    std::stringstream buffer;
+
+    for (uint32_t i = 0; i < data_length; i++) {
+        buffer << "0x" << std::setfill('0') << std::setw(2) << std::hex << uint32_t(data_ptr[i]) << " ";
+    }
+
+    return buffer.str();
+}
+
+bool read_ipv6_subnet_from_string(subnet_ipv6_cidr_mask_t& ipv6_address, const std::string& ipv6_subnet_as_string) {
+    extern log4cpp::Category& logger;
+
+    std::vector<std::string> subnet_as_string;
+
+    split(subnet_as_string, ipv6_subnet_as_string, boost::is_any_of("/"), boost::token_compress_on);
+
+    if (subnet_as_string.size() != 2) {
+        return false;
+    }
+
+    int cidr = 0;
+
+    bool conversion_result = convert_string_to_any_integer_safe(subnet_as_string[1], cidr);
+
+    if (!conversion_result) {
+        return false;
+    }
+
+    ipv6_address.cidr_prefix_length = cidr;
+
+    bool parsed_ipv6 = read_ipv6_host_from_string(subnet_as_string[0], ipv6_address.subnet_address);
+
+    if (!parsed_ipv6) {
+        logger << log4cpp::Priority::ERROR << "Can't parse IPv6 address: " << ipv6_subnet_as_string;
+        return false;
+    }
+
+    return true;
+}
+
+// Return true if we have this subnet in patricia tree
+bool subnet_belongs_to_patricia_tree(patricia_tree_t* patricia_tree, const subnet_cidr_mask_t& subnet) {
+    prefix_t prefix_for_check_adreess;
+    prefix_for_check_adreess.add.sin.s_addr = subnet.subnet_address;
+    prefix_for_check_adreess.family         = AF_INET;
+    prefix_for_check_adreess.bitlen         = subnet.cidr_prefix_length;
+
+    patricia_node_t* found_patrica_node = patricia_search_best2(patricia_tree, &prefix_for_check_adreess, 1);
+
+    if (found_patrica_node != NULL) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// Prepares textual dump of simple packets buffer
+void print_simple_packet_buffer_to_string(const boost::circular_buffer<simple_packet_t>& simple_packets_buffer, std::string& output) {
+    if (simple_packets_buffer.size() != 0) {
+        std::stringstream ss;
+
+        for (const simple_packet_t& packet : simple_packets_buffer) {
+            ss << print_simple_packet(packet);
+        }
+
+        output = ss.str();
+    }
+}
+
+

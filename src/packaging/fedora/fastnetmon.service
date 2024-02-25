@@ -5,13 +5,13 @@ After=network.target remote-fs.target
  
 [Service]
 Type=simple
-ExecStart=/usr/sbin/fastnetmon --log_to_console --disable_pid_logic
+ExecStart=/usr/sbin/fastnetmon --log_to_console
 User=fastnetmon
 Group=fastnetmon
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65535
-# We need it to use AF_PACKET when run under non root user
+# We need it to use AF_PACKET and AF_XDP when run under non root user
 AmbientCapabilities=CAP_NET_RAW CAP_IPC_LOCK
 
 [Install]

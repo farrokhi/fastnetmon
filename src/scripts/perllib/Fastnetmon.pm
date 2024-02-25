@@ -118,6 +118,15 @@ sub get_library_binary_build_from_google_storage {
 
     my $binary_path = "s3://$s3_bucket_binary_dependency_name/$distro_type/$distro_version/$dependency_archive_name";
 
+    # It can be: x86_64 or aarch64
+    my $machine_architecture = `uname -m`;
+    chomp $machine_architecture;
+
+    # We added ARM platforms later and we use another path for them
+    if ($machine_architecture eq 'aarch64') {
+        $binary_path = "s3://$s3_bucket_binary_dependency_name/$machine_architecture/$distro_type/$distro_version/$dependency_archive_name";
+    }
+
     # print "Will use following path to retrieve dependency: $binary_path\n";
     my $download_file_return_code =
         system("s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket=\"%(bucket).storage.googleapis.com\" get $binary_path /tmp/$dependency_archive_name >/dev/null 2>&1");
@@ -132,11 +141,18 @@ sub get_library_binary_build_from_google_storage {
     # Hashes for all distros
     my $data_hashes = shift;
 
-    my $current_build_hash = $data_hashes->{ "$distro_type:$distro_version" };
+    my $key_name = "$distro_type:$distro_version";
+
+    # We use another structure of hash for ARM
+    if ($machine_architecture eq 'aarch64') {
+        $key_name = "$distro_type:$machine_architecture:$distro_version";
+    }
+
+    my $current_build_hash = $data_hashes->{ $key_name };
 
     # Hash must exist for all our existing dependencies
     unless ($current_build_hash) {
-        warn "Cannot get $dependency_name hash for Distro $distro_type $distro_version, please add it to build configuration";
+        warn "Cannot get $dependency_name hash for Distro $distro_type $distro_version architecture $machine_architecture, please add it to build configuration";
         return 2;
     }
 
@@ -178,6 +194,15 @@ sub upload_binary_build_to_google_storage {
 
     my $binary_path = "s3://$s3_bucket_binary_dependency_name/$distro_type/$distro_version/$dependency_archive_name";
 
+    # It can be: x86_64 or aarch64
+    my $machine_architecture = `uname -m`;
+    chomp $machine_architecture;
+
+    # We added ARM platforms later and we use another path for them
+    if ($machine_architecture eq 'aarch64') {
+        $binary_path = "s3://$s3_bucket_binary_dependency_name/$machine_architecture/$distro_type/$distro_version/$dependency_archive_name";
+    }
+
     my $archive_res = system("tar --use-compress-program=pigz -cpf /tmp/$dependency_archive_name -C $library_install_folder $dependency_name");
 
     if ($archive_res != 0) {
@@ -189,7 +214,7 @@ sub upload_binary_build_to_google_storage {
         system("s3cmd --disable-multipart  --host=storage.googleapis.com --host-bucket=\"%(bucket).storage.googleapis.com\" put /tmp/$dependency_archive_name $binary_path");
 
     if ($upload_this_file != 0) {
-        print "Cannot upload dependency file from Google Storage\n";
+        print "Cannot upload dependency file to /tmp/$dependency_archive_name Google Storage\n";
         return '';
     }
 
@@ -212,9 +237,10 @@ sub upload_binary_build_to_google_storage {
 sub exec_command {
     my $command = shift;
 
-    open my $fl, ">>", $install_log_path;
+    open my $fl, ">>", $install_log_path or warn "Cannot open $install_log_path $!";;
+    
     print {$fl} "We are calling command: $command\n\n";
- 
+
     my $output = `$command 2>&1`;
   
     print {$fl} "Command finished with code $?\n\n";
@@ -514,10 +540,10 @@ sub install_gcc {
     my $gcc_package_install_path = "$library_install_folder/$folder_name";
 
     if ($distro_type eq 'ubuntu' || $distro_type eq 'debian') {
-        my @dependency_list = ('libmpfr-dev', 'libmpc-dev', 'libgmp-dev', 'gcc', 'g++');
+        my @dependency_list = ('libmpfr-dev', 'libmpc-dev', 'libgmp-dev', 'gcc', 'g++', 'diffutils');
         apt_get(@dependency_list);
     } elsif ($distro_type eq 'centos') {
-        yum('gmp-devel', 'mpfr-devel', 'libmpc-devel', 'gcc', 'gcc-c++');
+        yum('gmp-devel', 'mpfr-devel', 'libmpc-devel', 'gcc', 'gcc-c++', 'diffutils');
     }
 
     print "Download gcc archive\n";
@@ -702,7 +728,7 @@ sub install_boost_build {
 sub install_log4cpp {
     my $folder_name = shift;
 
-    my $log_cpp_version_short = '1.1.3';
+    my $log_cpp_version_short = '1.1.4rc3';
 
     my $log4cpp_install_path = "$library_install_folder/$folder_name";
 
@@ -712,7 +738,7 @@ sub install_log4cpp {
     chdir $temp_folder_for_building_project;
 
     print "Download log4cpp sources\n";
-    my $log4cpp_download_result = download_file($log4cpp_url, $distro_file_name, '74f0fea7931dc1bc4e5cd34a6318cd2a51322041');
+    my $log4cpp_download_result = download_file($log4cpp_url, $distro_file_name, 'b32e6ec981a5d75864e1097525e1f502cc242d17');
 
     unless ($log4cpp_download_result) {
         warn "Can't download log4cpp\n";
@@ -723,32 +749,67 @@ sub install_log4cpp {
     exec_command("tar -xf $distro_file_name");
     chdir "$temp_folder_for_building_project/log4cpp";
 
-    if ($distro_architecture eq 'aarch64') {
-        # TODO: unfortunately, I removed these files and we need to switch to master build: https://git.code.sf.net/p/log4cpp/codegit
-        # commit: 2e117d81e94ec4f9c5af42fcf76a0583a036e106
-        # For arm64 build we need multiple fixes
-        # checking build system type... config/config.guess: unable to guess system type
-        # configure: error: cannot guess build type; you must specify one
-        exec_command("curl https://raw.githubusercontent.com/pavel-odintsov/config/master/config.guess -o./config/config.guess");
-        exec_command("curl https://raw.githubusercontent.com/pavel-odintsov/config/master/config.sub -o./config/config.sub");
-    }
-
     print "Build log4cpp\n";
 
-    # TODO: we need some more reliable way to specify options here
+    my $configure_result = '';
+
+    # We need to address bug on ARM 64 platforms:
+    # configure: error: cannot guess build type; you must specify one
+    # https://github.com/pavel-odintsov/fastnetmon/issues/980
+    my $log4cpp_configure_params = '';
+
+    # It can be: x86_64 or aarch64
+    my $machine_architecture = `uname -m`;
+    chomp $machine_architecture;
+
+    # We can specify build type manually
+    # TODO: we need to report this solution to upstream: https://github.com/nzbget/nzbget/issues/418
+    if ($machine_architecture eq 'aarch64') {
+        $log4cpp_configure_params = '--build=aarch64-unknown-linux-gnu';
+    }
+
     if ($configure_options) {
-        exec_command("$configure_options ./configure --prefix=$log4cpp_install_path");
+        $configure_result = exec_command("$configure_options ./configure --prefix=$log4cpp_install_path $log4cpp_configure_params");
     } else {
-        exec_command("./configure --prefix=$log4cpp_install_path");
-    }    
+        $configure_result = exec_command("./configure --prefix=$log4cpp_install_path $log4cpp_configure_params");
+    }
+
+    if (!$configure_result) {
+        die "Cannot configure log4cpp\n";
+    }
 
     my $make_result = exec_command("$ld_library_path_for_make make $make_options install"); 
 
     if (!$make_result) {
-        print "make for log4cpp failed\n";
+        die "Make for log4cpp failed\n";
     }
 
     1;
+}
+
+sub install_pcap {
+    my $folder_name = shift;
+
+    print "Install packages\n";
+
+    if ($distro_type eq 'ubuntu' or $distro_type eq 'debian') {
+        print "Update package manager cache\n";
+        exec_command("apt-get update");
+        apt_get('flex', 'bison');
+    } elsif ( $distro_type eq 'centos') {
+        print "Install packages\n";
+        yum('flex', 'bison');
+    }   
+
+    my $res = install_configure_based_software("https://www.tcpdump.org/release/libpcap-1.10.4.tar.gz",
+        "818cbe70179c73eebfe1038854665f33aac64245", "$library_install_folder/$folder_name", "--disable-usb --disable-netmap --disable-bluetooth --disable-dbus --disable-rdma "); 
+
+    unless ($res) {
+        warn "Cannot install libpcap\n";
+        return '';
+    }    
+
+    return 1;
 }
 
 sub install_cares {
@@ -869,12 +930,24 @@ sub git_clone_repository {
 # We do not use cache for it yet
 sub install_gobgp {
     my $folder_name = shift;
-
-    chdir $temp_folder_for_building_project;
-    my $distro_file_name = 'gobgp_2.27.0_linux_amd64.tar.gz';
     
-    my $download_result = download_file("https://github.com/osrg/gobgp/releases/download/v2.27.0/$distro_file_name",
-        $distro_file_name, 'dd906c552a727d3f226f3851bf2c92bfdafb92a7'); 
+    chdir $temp_folder_for_building_project;
+
+    # It can be: x86_64 or aarch64
+    my $machine_architecture = `uname -m`;
+    chomp $machine_architecture;
+
+    my $distro_file_name = 'gobgp_3.12.0_linux_amd64.tar.gz';
+    my $gobgp_sha1 = 'eca957a8991b8ef6eceef665a9f15a3717827a09';
+
+    # We download pre compiled binaries and we need to download different file for ARM64 platform
+    if ($machine_architecture eq 'aarch64') {
+        $distro_file_name = 'gobgp_3.12.0_linux_arm64.tar.gz';
+        $gobgp_sha1 = 'ba42e5c7fb92638a7ced9d30fc20b24925e0a923';
+    }
+
+    my $download_result = download_file("https://github.com/osrg/gobgp/releases/download/v3.12.0/$distro_file_name",
+        $distro_file_name, $gobgp_sha1); 
 
     unless ($download_result) {
         warn "Could not download gobgp\n";

@@ -1,5 +1,7 @@
 #include "../all_logcpp_libraries.hpp"
 
+#include "../fastnetmon_plugin.hpp"
+
 #include <boost/algorithm/string.hpp>
 #include <boost/version.hpp>
 
@@ -141,6 +143,11 @@ void walk_block(struct block_desc* pbd, const int block_num) {
         u_char* data_pointer = (u_char*)((uint8_t*)ppd + ppd->tp_mac);
 
         simple_packet_t packet;
+
+        packet.source       = MIRROR;
+        packet.arrival_time = current_inaccurate_time;
+        packet.sample_ratio = 1; //-V1048
+
 
         // Override default sample rate by rate specified in configuration
         if (mirror_af_packet_custom_sampling_rate > 1) {
@@ -313,9 +320,26 @@ void start_af_packet_capture(std::string interface_name, bool enable_fanout, int
     setup_socket(interface_name, enable_fanout, fanout_group_id);
 }
 
-void get_af_packet_stats() {
-    // getsockopt PACKET_STATISTICS
+std::vector<system_counter_t> get_af_packet_stats() {
+    std::vector<system_counter_t> system_counter;
+
+    system_counter.push_back(system_counter_t("af_packet_socket_received_packets", socket_received_packets,
+                                              metric_type_t::counter, socket_received_packets_desc));
+    system_counter.push_back(system_counter_t("af_packet_socket_dropped_packets", socket_dropped_packets,
+                                              metric_type_t::counter, socket_dropped_packets_desc));
+
+    system_counter.push_back(system_counter_t("af_packet_blocks_read", blocks_read, metric_type_t::counter, blocks_read_desc));
+    system_counter.push_back(system_counter_t("af_packet_packets_raw", af_packet_packets_raw, metric_type_t::counter,
+                                              af_packet_packets_raw_desc));
+
+    system_counter.push_back(system_counter_t("af_packet_packets_parsed", af_packet_packets_parsed,
+                                              metric_type_t::counter, af_packet_packets_parsed_desc));
+    system_counter.push_back(system_counter_t("af_packet_packets_unparsed", af_packet_packets_unparsed,
+                                              metric_type_t::counter, af_packet_packets_unparsed_desc));
+
+    return system_counter;
 }
+
 
 // Could get some speed up on NUMA servers
 bool afpacket_execute_strict_cpu_affinity = false;
@@ -397,8 +421,6 @@ void start_af_packet_capture_for_interface(std::string capture_interface, int fa
             logger << log4cpp::Priority::INFO << "Start AF_PACKET worker process for " << capture_interface
                    << " with fanout group id " << fanout_group_id << " on CPU " << cpu;
 
-// Well, we have thread attributes from Boost 1.50
-#if defined(BOOST_THREAD_PLATFORM_PTHREAD) && BOOST_VERSION / 100 % 1000 >= 50 && defined(__GLIBC__)
             boost::thread::attributes thread_attrs;
 
             if (afpacket_execute_strict_cpu_affinity) {
@@ -421,14 +443,6 @@ void start_af_packet_capture_for_interface(std::string capture_interface, int fa
 
             packet_receiver_thread_group.add_thread(
                 new boost::thread(thread_attrs, boost::bind(start_af_packet_capture, capture_interface, fanout, fanout_group_id)));
-#else
-            bool fanout = true;
-
-            logger.error("Sorry but CPU affinity did not supported for your platform");
-
-            packet_receiver_thread_group.add_thread(
-                new boost::thread(start_af_packet_capture, capture_interface, fanout, fanout_group_id));
-#endif
         }
 
         // Wait all processes for finish

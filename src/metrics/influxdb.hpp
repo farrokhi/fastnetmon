@@ -33,7 +33,7 @@ bool push_hosts_ipv6_traffic_counters_to_influxdb(std::string influx_database,
                                                   std::string influx_user,
                                                   std::string influx_password);
 
-bool push_hosts_traffic_counters_to_influxdb(std::string influx_database,
+bool push_hosts_ipv4_traffic_counters_to_influxdb(std::string influx_database,
                                              std::string influx_host,
                                              std::string influx_port,
                                              bool enable_auth,
@@ -55,15 +55,8 @@ bool write_batch_of_data_to_influxdb(std::string influx_database,
                                      std::string influx_password,
                                      std::string measurement,
                                      std::string tag_name,
-                                     std::vector<std::pair<std::string, std::map<std::string, uint64_t>>>& hosts_vector);
-
-
-bool push_network_traffic_counters_to_influxdb(std::string influx_database,
-                                               std::string influx_host,
-                                               std::string influx_port,
-                                               bool enable_auth,
-                                               std::string influx_user,
-                                               std::string influx_password);
+                                     std::vector<std::pair<std::string, std::map<std::string, uint64_t>>>& hosts_vector,
+                                     std::string& error_text);
 
 
 // Set block of data into InfluxDB
@@ -80,12 +73,12 @@ bool write_line_of_data_to_influxdb(std::string influx_database,
 void fill_per_protocol_countres_for_influxdb(const subnet_counter_t* current_speed_element,
                                              std::map<std::string, uint64_t>& plain_total_counters_map);
 
-void fill_main_counters_for_influxdb(const subnet_counter_t* current_speed_element,
+void fill_main_counters_for_influxdb(const subnet_counter_t& current_speed_element,
                                      std::map<std::string, uint64_t>& plain_total_counters_map,
                                      bool populate_flow);
 
 // Prepare string to insert data into InfluxDB
 std::string craft_line_for_influxdb_line_protocol(uint64_t unix_timestamp_nanoseconds,
                                                   std::string measurement,
-                                                  std::map<std::string, std::string>& tags,
-                                                  std::map<std::string, uint64_t>& plain_total_counters_map);
+                                                  const std::map<std::string, std::string>& tags,
+                                                  const std::map<std::string, uint64_t>& plain_total_counters_map);

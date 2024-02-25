@@ -3,6 +3,17 @@ class Fastnetmon < Formula
   homepage "https://github.com/pavel-odintsov/fastnetmon/"
   license "GPL-2.0-only"
   head "https://github.com/pavel-odintsov/fastnetmon.git"
+  revision 5
+
+  bottle do
+    sha256 cellar: :any,                 arm64_sonoma:   "e2224278e6a039eb8815b070dbec167059c97c45ce140d040e743933551f4aa6"
+    sha256 cellar: :any,                 arm64_ventura:  "867ad398c827b030e7a37c6ae7ec43424b5f39049712ad4e73ad9f34272af6d8"
+    sha256 cellar: :any,                 arm64_monterey: "289219de6117e93818efe215608ec63a581f65a844796296b8c8dcf7131e4282"
+    sha256 cellar: :any,                 sonoma:         "4e2b2eaae5b1208543fd6cba7d17319c61dca90694f353ae68271677da81b0a5"
+    sha256 cellar: :any,                 ventura:        "ca02b5e0eaf4c162a32529427ee82f9ce322dfd76f74da6da5f217ff3d0e733d"
+    sha256 cellar: :any,                 monterey:       "c69862f99e4e368ff2df5ffabdb74b04c415b8441f22ea7fdd2cb1bab24f1e57"
+    sha256 cellar: :any_skip_relocation, x86_64_linux:   "3e789634cedde18c8806a0d23a9469f72bc0f95da40f5e5556457f8a54425d9f"
+  end
 
   depends_on "cmake" => :build
   depends_on "abseil"
@@ -10,19 +21,17 @@ class Fastnetmon < Formula
   depends_on "capnp"
   depends_on "grpc"
   depends_on "hiredis"
-  depends_on "json-c"
   depends_on "log4cpp"
   depends_on macos: :big_sur # We need C++ 20 available for build which is available from Big Sur
   depends_on "mongo-c-driver"
-  depends_on "openssl@1.1"
+  depends_on "openssl@3"
+  depends_on "protobuf"
   uses_from_macos "ncurses"
 
   on_linux do
-    depends_on "gcc"
+    depends_on "elfutils"
     depends_on "libbpf"
-    depends_on "libelf"
     depends_on "libpcap"
-    depends_on "ncurses"
   end
 
   fails_with gcc: "5"
@@ -41,8 +50,7 @@ class Fastnetmon < Formula
       opt_sbin/"fastnetmon",
       "--configuration_file",
       etc/"fastnetmon.conf",
-      "--log_to_console",
-      "--disable_pid_logic",
+      "--log_to_console"
     ]
     keep_alive false
     working_dir HOMEBREW_PREFIX
@@ -53,9 +61,9 @@ class Fastnetmon < Formula
   test do
     cp etc/"fastnetmon.conf", testpath
 
-    inreplace testpath/"fastnetmon.conf", "/tmp/fastnetmon.dat", testpath/"fastnetmon.dat"
+    inreplace testpath/"fastnetmon.conf", "/tmp/fastnetmon.dat", (testpath/"fastnetmon.dat").to_s
 
-    inreplace testpath/"fastnetmon.conf", "/tmp/fastnetmon_ipv6.dat", testpath/"fastnetmon_ipv6.dat"
+    inreplace testpath/"fastnetmon.conf", "/tmp/fastnetmon_ipv6.dat", (testpath/"fastnetmon_ipv6.dat").to_s
 
     fastnetmon_pid = fork do
       exec opt_sbin/"fastnetmon",
@@ -80,3 +88,4 @@ class Fastnetmon < Formula
     Process.kill "SIGTERM", fastnetmon_pid
   end
 end
+

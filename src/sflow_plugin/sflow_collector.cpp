@@ -1,31 +1,32 @@
 #include <climits>
-#include <inttypes.h>
 #include <iomanip>
 #include <iostream>
-#include <sys/types.h>
 #include <type_traits>
 
 #include "../libsflow/libsflow.hpp"
 #include "sflow_collector.hpp"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2ipdef.h> // sockaddr_in6
+#include <ws2tcpip.h> // socklen_t
+#else
+#include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-
-// UDP server
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
+#endif
 
 #include "../fast_library.hpp"
+#include "../fastnetmon_plugin.hpp"
 
 #include "../all_logcpp_libraries.hpp"
 
 extern log4cpp::Category& logger;
 
 #include "../simple_packet_parser_ng.hpp"
+
+#include <boost/algorithm/string.hpp>
 
 // Global configuration map
 extern std::map<std::string, std::string> configuration_map;
@@ -137,7 +138,7 @@ bool process_sflow_counter_sample(uint8_t* data_pointer,
                                   const sflow_packet_header_unified_accessor& sflow_header_accessor);
 process_packet_pointer sflow_process_func_ptr = NULL;
 
-void start_sflow_collector(std::string interface_for_binding, unsigned int sflow_port);
+void start_sflow_collector(const std::string& sflow_host, unsigned int sflow_port);
 
 // Initialize sflow module, we need it for allocation per module structures
 void init_sflow_module() {
@@ -202,35 +203,47 @@ void start_sflow_collection(process_packet_pointer func_ptr) {
     sflow_collector_threads.join_all();
 }
 
-void start_sflow_collector(std::string interface_for_binding, unsigned int sflow_port) {
+void start_sflow_collector(const std::string& sflow_host, unsigned int sflow_port) {
 
-    logger << log4cpp::Priority::INFO << plugin_log_prefix << "plugin will listen on " << interface_for_binding << ":"
+    logger << log4cpp::Priority::INFO << plugin_log_prefix << "plugin will listen on " << sflow_host << ":"
            << sflow_port << " udp port";
 
-    unsigned int udp_buffer_size = 65536;
-    char udp_buffer[udp_buffer_size];
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
 
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
 
-    struct sockaddr_in servaddr;
-    memset(&servaddr, 0, sizeof(servaddr));
+    // AI_PASSIVE to handle empty sflow_host as bind on all interfaces
+    // AI_NUMERICHOST to allow only numerical host
+    hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
 
-    servaddr.sin_family = AF_INET;
+    addrinfo* servinfo = NULL;
 
-    if (interface_for_binding == "0.0.0.0") {
-        servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    } else {
-        servaddr.sin_addr.s_addr = inet_addr(interface_for_binding.c_str());
-    }
+    int getaddrinfo_result = getaddrinfo(sflow_host.c_str(), std::to_string(sflow_port).c_str(), &hints, &servinfo);
 
-    servaddr.sin_port = htons(sflow_port);
-    int bind_result   = bind(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr));
-
-    if (bind_result) {
-        logger << log4cpp::Priority::ERROR << plugin_log_prefix << "can't listen port: " << sflow_port << " on host "
-               << interface_for_binding;
+    if (getaddrinfo_result != 0) {
+        logger << log4cpp::Priority::ERROR << "sFlow getaddrinfo function failed with code: " << getaddrinfo_result
+               << " please check sflow_host syntax";
         return;
     }
+
+    int sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
+
+    if (sockfd == -1) {
+        logger << log4cpp::Priority::ERROR << "Cannot create socket with error " << errno << " error message: " << strerror(errno);
+        return;
+    }
+
+    int bind_result = bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+
+    if (bind_result != 0) {
+        logger << log4cpp::Priority::ERROR << plugin_log_prefix << "cannot bind on " << sflow_port << ":"
+               << sflow_host << " with errno: " << errno << " error: " << strerror(errno);
+        return;
+    }
+
+    freeaddrinfo(servinfo);
 
     struct sockaddr_in6 peer;
     memset(&peer, 0, sizeof(peer));
@@ -247,7 +260,11 @@ void start_sflow_collector(std::string interface_for_binding, unsigned int sflow
     socklen_t value_length = sizeof(receive_buffer);
 
     // Get current read buffer size
-    int get_buffer_size_res = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, &value_length);
+   
+    // Windows uses char* as 4rd argument: https://learn.microsoft.com/en-gb/windows/win32/api/winsock/nf-winsock-getsockopt and we need to add explicit cast
+    // Linux uses void* https://linux.die.net/man/2/setsockopt
+    // So I think char* works for both platforms
+    int get_buffer_size_res = getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char*)&receive_buffer, &value_length);
 
     if (get_buffer_size_res != 0) {
         logger << log4cpp::Priority::ERROR << "Cannot retrieve default receive buffer size for sFlow";
@@ -256,6 +273,9 @@ void start_sflow_collector(std::string interface_for_binding, unsigned int sflow
     }
 
     while (true) {
+        unsigned int udp_buffer_size = 65536;
+        char udp_buffer[udp_buffer_size];
+
         struct sockaddr_in client_addr;
         socklen_t address_len = sizeof(client_addr);
 
@@ -320,7 +340,7 @@ bool process_sflow_flow_sample(uint8_t* data_pointer,
 
     uint8_t* flow_record_zone_start = data_pointer + sflow_sample_header_unified_accessor.get_original_payload_length();
 
-    vector_tuple_t vector_tuple;
+    std::vector<record_tuple_t> vector_tuple;
     vector_tuple.reserve(sflow_sample_header_unified_accessor.get_number_of_flow_records());
 
     bool padding_found = false;
@@ -341,7 +361,8 @@ bool process_sflow_flow_sample(uint8_t* data_pointer,
     }
 
     simple_packet_t packet;
-    packet.source = SFLOW;
+    packet.source       = SFLOW;
+    packet.arrival_time = current_inaccurate_time;
 
     packet.agent_ip_address = client_ipv4_address;
 
@@ -415,9 +436,9 @@ bool process_sflow_flow_sample(uint8_t* data_pointer,
             }
 
             // Pass pointer to raw header to FastNetMon processing functions
-            packet.packet_payload_pointer     = header_payload_pointer;
-            packet.packet_payload_full_length = sflow_raw_protocol_header.frame_length_before_sampling;
-            packet.packet_payload_length      = sflow_raw_protocol_header.header_size;
+            packet.payload_pointer     = header_payload_pointer;
+            packet.payload_full_length = sflow_raw_protocol_header.frame_length_before_sampling;
+            packet.captured_payload_length      = sflow_raw_protocol_header.header_size;
 
             packet.sample_ratio = sflow_sample_header_unified_accessor.sampling_rate;
 
@@ -494,7 +515,7 @@ void parse_sflow_v5_packet(uint8_t* payload_ptr, unsigned int payload_length, ui
         return;
     }
 
-    vector_sample_tuple_t samples_vector;
+    std::vector<sample_tuple_t> samples_vector;
     samples_vector.reserve(sflow_header_accessor.get_datagram_samples_count());
 
     uint8_t* samples_block_start = payload_ptr + sflow_header_accessor.get_original_payload_length();
@@ -581,7 +602,7 @@ bool process_sflow_counter_sample(uint8_t* data_pointer,
         return false;
     }
 
-    counter_record_sample_vector_t counter_record_sample_vector;
+    std::vector<counter_record_sample_t> counter_record_sample_vector;
     counter_record_sample_vector.reserve(sflow_counter_header_unified_accessor.get_number_of_counter_records());
 
     bool get_all_counter_records_result =

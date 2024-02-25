@@ -24,7 +24,18 @@ unless ($package_type && $archive_name && $package_version && $distro_name && $d
 # By default it uses compression level 6
 my $dpkg_deb_options = '-Zxz -z6';
 
+# It can be: x86_64 or aarch64
+my $machine_architecture = `uname -m`;
+chomp $machine_architecture;
+
+# For number of places we need Debian specific name for particular architectures
 my $debian_architecture_name = 'amd64';
+
+if ($machine_architecture eq 'aarch64') {
+    $debian_architecture_name = 'arm64';
+} elsif ($machine_architecture eq 'x86_64') {
+    $debian_architecture_name = 'amd64';
+}
 
 if ($package_type eq 'rpm') {
     build_rpm_package();
@@ -50,7 +61,7 @@ After=network.target remote-fs.target
  
 [Service]
 Type=simple
-ExecStart=/opt/fastnetmon-community/app/bin/fastnetmon --disable_pid_logic
+ExecStart=/opt/fastnetmon-community/app/bin/fastnetmon
 LimitNOFILE=65535
 # Restart service when it fails due to any reasons, we need to keep processing traffic no matter what happened
 Restart=on-failure
@@ -126,7 +137,7 @@ DOC
     my $spec_file_summary_section = <<'DOC';
 Release:           1%{?dist}
 
-Summary:           A high performance DoS/DDoS load analyzer built on top of multiple packet capture engines (NetFlow, IPFIX, sFLOW, netmap, PCAP).
+Summary:           A high performance DoS/DDoS load analyzer built on top of multiple packet capture engines (NetFlow, IPFIX, sFLOW, Netmap, PCAP).
 Group:             System Environment/Daemons
 License:           GPLv2
 URL:               https://fastnetmon.com
@@ -142,7 +153,6 @@ DOC
 
     my $spec_file_requires_systemd_section = <<'DOC';
 
-Requires:          libpcap
 Requires(pre):     shadow-utils
 Requires(post):    systemd
 Requires(preun):   systemd
@@ -273,7 +283,7 @@ DOC
     }
 
     mkdir "/tmp/result_data" or die "Cannot create result_data folder";
-    my $copy_rpm_res = system("cp /root/rpmbuild/RPMS/x86_64/* /tmp/result_data");
+    my $copy_rpm_res = system("cp /root/rpmbuild/RPMS/$machine_architecture/* /tmp/result_data");
     
     if ($copy_rpm_res != 0) {
         die "Cannot copy result rpm\n";
@@ -293,7 +303,7 @@ After=network.target remote-fs.target
  
 [Service]
 Type=simple
-ExecStart=/opt/fastnetmon-community/app/bin/fastnetmon --disable_pid_logic
+ExecStart=/opt/fastnetmon-community/app/bin/fastnetmon
 LimitNOFILE=65535
 # Restart service when it fails due to any reasons, we need to keep processing traffic no matter what happened
 Restart=on-failure
@@ -310,7 +320,6 @@ Section: misc
 Priority: optional
 Architecture: $debian_architecture_name
 Version: $package_version
-Depends: libpcap0.8
 Description: Very fast DDoS analyzer with sFlow/Netflow/IPFIX and mirror support
  FastNetMon - A high performance DoS/DDoS attack sensor.
 DOC

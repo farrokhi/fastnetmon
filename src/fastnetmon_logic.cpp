@@ -18,9 +18,15 @@
 #include "fast_library.hpp"
 #include "fast_platform.hpp"
 
+#include "fast_endianless.hpp"
+
 // Plugins
 #include "netflow_plugin/netflow_collector.hpp"
+
+#ifdef ENABLE_PCAP
 #include "pcap_plugin/pcap_collector.hpp"
+#endif
+
 #include "sflow_plugin/sflow_collector.hpp"
 
 #ifdef NETMAP_PLUGIN
@@ -69,17 +75,13 @@ extern std::string cli_stats_file_path;
 extern unsigned int total_number_of_hosts_in_our_networks;
 extern abstract_subnet_counters_t<subnet_cidr_mask_t, subnet_counter_t> ipv4_network_counters;
 extern unsigned int recalculate_speed_timeout;
-extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
 extern bool DEBUG_DUMP_ALL_PACKETS;
 extern bool DEBUG_DUMP_OTHER_PACKETS;
 extern uint64_t total_ipv4_packets;
-extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6_ng;
 extern uint64_t total_ipv6_packets;
-extern map_of_vector_counters_t SubnetVectorMapSpeed;
 extern double average_calculation_amount;
 extern bool print_configuration_params_on_the_screen;
 extern uint64_t our_ipv6_packets;
-extern map_of_vector_counters_t SubnetVectorMap;
 extern uint64_t unknown_ip_version_packets;
 extern uint64_t total_simple_packets_processed;
 extern unsigned int maximum_time_since_bucket_start_to_remove;
@@ -112,9 +114,7 @@ extern bool exabgp_announce_whole_subnet;
 extern subnet_to_host_group_map_t subnet_to_host_groups;
 extern bool collect_attack_pcap_dumps;
 
-extern std::mutex ban_list_details_mutex;
-extern std::mutex ban_list_mutex;
-extern std::mutex flow_counter;
+extern std::mutex flow_counter_mutex;
 
 #ifdef REDIS
 extern unsigned int redis_port;
@@ -139,11 +139,9 @@ extern std::string mongodb_database_name;
 extern unsigned int number_of_packets_for_pcap_attack_dump;
 extern patricia_tree_t *lookup_tree_ipv4, *whitelist_tree_ipv4;
 extern patricia_tree_t *lookup_tree_ipv6, *whitelist_tree_ipv6;
-extern std::map<uint32_t, std::vector<simple_packet_t>> ban_list_details;
 extern ban_settings_t global_ban_settings;
 extern bool exabgp_enabled;
 extern bool gobgp_enabled;
-extern map_of_vector_counters_t SubnetVectorMapSpeedAverage;
 extern int global_ban_time;
 extern bool notify_script_enabled;
 extern std::map<uint32_t, banlist_item_t> ban_list;
@@ -321,12 +319,14 @@ std::string print_ban_thresholds(ban_settings_t current_ban_settings) {
     return output_buffer.str();
 }
 
-void print_attack_details_to_file(std::string details, std::string client_ip_as_string, attack_details_t current_attack) {
+void print_attack_details_to_file(const std::string& details, const std::string& client_ip_as_string, const attack_details_t& current_attack) {
     std::ofstream my_attack_details_file;
 
+    // TODO: it may not work well with systems which do not allow ":" as part of file name (macOS)
     std::string ban_timestamp_as_string = print_time_t_in_fastnetmon_format(current_attack.ban_timestamp);
-    std::string attack_dump_path = fastnetmon_platform_configuration.attack_details_folder + "/" + client_ip_as_string +
-                                   "_" + ban_timestamp_as_string + ".txt";
+    
+    std::string attack_dump_path =
+        fastnetmon_platform_configuration.attack_details_folder + "/" + client_ip_as_string + "_" + ban_timestamp_as_string + ".txt";
 
     my_attack_details_file.open(attack_dump_path.c_str(), std::ios::app);
 
@@ -334,9 +334,10 @@ void print_attack_details_to_file(std::string details, std::string client_ip_as_
         my_attack_details_file << details << "\n\n";
         my_attack_details_file.close();
     } else {
-        logger << log4cpp::Priority::ERROR << "Can't print attack details to file";
+        logger << log4cpp::Priority::ERROR << "Can't print attack details to file" << attack_dump_path;
     }
 }
+
 
 logging_configuration_t read_logging_settings(configuration_map_t configuration_map) {
     logging_configuration_t logging_configuration_temp;
@@ -621,7 +622,7 @@ std::string print_flow_tracking_for_specified_protocol(contrack_map_type& protoc
 
         uint64_t packed_connection_data = itr->first;
         packed_conntrack_hash_t unpacked_key_struct;
-        convert_integer_to_conntrack_hash_struct(&packed_connection_data, &unpacked_key_struct);
+        convert_integer_to_conntrack_hash_struct(packed_connection_data, unpacked_key_struct);
 
         std::string opposite_ip_as_string = convert_ip_as_uint_to_string(unpacked_key_struct.opposite_ip);
         if (flow_direction == INCOMING) {
@@ -641,21 +642,160 @@ std::string print_flow_tracking_for_specified_protocol(contrack_map_type& protoc
     return buffer.str();
 }
 
-void convert_integer_to_conntrack_hash_struct(packed_session* packed_connection_data, packed_conntrack_hash_t* unpacked_data) {
-    memcpy(unpacked_data, packed_connection_data, sizeof(uint64_t));
+void convert_integer_to_conntrack_hash_struct(const uint64_t& packed_connection_data, packed_conntrack_hash_t& unpacked_data) {
+    // Normally this code will trigger
+    // warning: ‘void* memcpy(void*, const void*, size_t)’ copying an object of non-trivial type ‘class
+    // packed_conntrack_hash_t’ from an array of ‘const uint64_t’ {aka ‘const long unsigned int’} [-Wclass-memaccess]
+    // Yes, it's very bad practice to overwrite struct memory that way but we have enough safe guards (such as
+    // explicitly packed structure and static_assert with sizeof check for structure size) in place to do it We apply
+    // void* for target argument to suppress this warning
+    memcpy((void*)&unpacked_data, &packed_connection_data, sizeof(uint64_t));
 }
+
+// This function returns true when attack for particular IPv6 or IPv4 address is finished
+template <typename T>
+    requires std::is_same_v<T, subnet_ipv6_cidr_mask_t> ||
+    std::is_same_v<T, uint32_t> bool
+    attack_is_finished(const T& current_subnet,
+                       abstract_subnet_counters_t<T, subnet_counter_t>& host_counters) {
+
+    std::string client_ip_as_string = convert_any_ip_to_string(current_subnet);
+
+    subnet_counter_t average_speed_element;
+
+    // Retrieve static counters
+    bool result = host_counters.get_average_speed(current_subnet, average_speed_element);
+
+    // I think it's fine even if we run in flexible counters mode as we must have some traffic tracked by static counters in any case
+    if (!result) {
+        logger << log4cpp::Priority::INFO << "Could not find traffic speed for " << client_ip_as_string
+               << " in traffic structure. But that's fine because it may be removed by cleanup logic. It means that "
+                  "traffic is "
+                  "zero for long time and we can unban host";
+
+        return true;
+    }
+
+    // Lookup network for IP as we need it for hostgorup lookup logic
+    subnet_cidr_mask_t customer_subnet;
+    bool lookup_result =
+        lookup_ip_in_integer_form_inpatricia_and_return_subnet_if_found(lookup_tree_ipv4, current_subnet, customer_subnet);
+
+    if (!lookup_result) {
+        // It's not critical, we can ignore it
+        logger << log4cpp::Priority::WARN << "Could not get customer's network for IP " << convert_ip_as_uint_to_string(current_subnet);
+    }
+
+    std::string host_group_name;
+    ban_settings_t current_ban_settings = get_ban_settings_for_this_subnet(customer_subnet, host_group_name);
+
+    attack_detection_threshold_type_t attack_detection_source;
+    attack_detection_direction_type_t attack_detection_direction;
+
+    bool should_block_static_thresholds = we_should_ban_this_entity(average_speed_element, current_ban_settings,
+                                                                    attack_detection_source, attack_detection_direction);
+
+    if (should_block_static_thresholds) {
+        logger << log4cpp::Priority::DEBUG << "Attack to IP " << client_ip_as_string
+               << " is still going. We should not unblock this host";
+
+        // Well, we still see an attack, skip to next iteration
+        return false;
+    }
+
+    return true;
+}
+
+
+// Unbans host which are ready to it
+void execute_unban_operation_ipv4() {
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
+    time_t current_time;
+    time(&current_time);
+
+    std::vector<uint32_t> ban_list_items_for_erase;
+
+    std::map<uint32_t, attack_details_t> ban_list_copy;
+
+    // Get whole ban list content atomically
+    ban_list_ipv4.get_whole_banlist(ban_list_copy);
+
+    for (auto itr = ban_list_copy.begin(); itr != ban_list_copy.end(); ++itr) {
+        uint32_t client_ip = itr->first;
+
+        // This IP should be banned permanently and we skip any processing
+        if (!itr->second.unban_enabled) {
+            continue;
+        }
+
+        // This IP banned manually and we should not unban it automatically
+        if (itr->second.attack_detection_source == attack_detection_source_t::Manual) {
+            continue;
+        }
+
+        double time_difference = difftime(current_time, itr->second.ban_timestamp);
+        int current_ban_time   = itr->second.ban_time;
+
+        // Yes, we reached end of ban time for this customer
+        bool we_could_unban_this_ip = time_difference > current_ban_time;
+
+        // We haven't reached time for unban yet
+        if (!we_could_unban_this_ip) {
+            continue;
+        }
+
+        // Check about ongoing attack
+        if (unban_only_if_attack_finished) {
+            std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
+
+            if (!attack_is_finished(client_ip, ipv4_host_counters)) {
+                logger << log4cpp::Priority::INFO << "Skip unban operation for " << client_ip_as_string
+                       << " because attack is still active";
+                continue;
+            }
+        }
+
+        // Add this IP to remove list
+        // We will remove keys really after this loop
+        ban_list_items_for_erase.push_back(itr->first);
+
+        // Call all hooks for unban
+        subnet_ipv6_cidr_mask_t zero_ipv6_address;
+
+        // It's empty for unban
+        std::string flow_attack_details;
+
+        // These are empty too
+        boost::circular_buffer<simple_packet_t> simple_packets_buffer;
+        boost::circular_buffer<fixed_size_packet_storage_t> raw_packets_buffer;
+
+        call_blackhole_actions_per_host(attack_action_t::unban, itr->first, zero_ipv6_address, false, itr->second,
+                                        attack_detection_source_t::Automatic, flow_attack_details,
+                                        simple_packets_buffer, raw_packets_buffer);
+    }
+
+    // Remove all unbanned hosts from the ban list
+    for (auto ban_element_for_erase : ban_list_items_for_erase) {
+        ban_list_ipv4.remove_from_blackhole(ban_element_for_erase);
+    }
+}
+
 
 // Unbans host which are ready to it
 void execute_unban_operation_ipv6() {
     time_t current_time;
     time(&current_time);
 
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
+
     std::vector<subnet_ipv6_cidr_mask_t> ban_list_items_for_erase;
 
     std::map<subnet_ipv6_cidr_mask_t, banlist_item_t> ban_list_copy;
 
     // Get whole ban list content atomically
-    ban_list_ipv6_ng.get_whole_banlist(ban_list_copy);
+    ban_list_ipv6.get_whole_banlist(ban_list_copy);
 
     for (auto itr : ban_list_copy) {
         // This IP should be banned permanentely and we skip any processing
@@ -684,17 +824,27 @@ void execute_unban_operation_ipv6() {
         }
 
         // Add this IP to remove list
-        // We will remove keyas really after this loop
+        // We will remove keys really after this loop
         ban_list_items_for_erase.push_back(itr.first);
 
         // Call all hooks for unban
         uint32_t zero_ipv4_ip_address = 0;
-        call_unban_handlers(zero_ipv4_ip_address, itr.first, true, itr.second, attack_detection_source_t::Automatic);
+
+        // It's empty for unban
+        std::string flow_attack_details;
+
+        // These are empty too
+        boost::circular_buffer<simple_packet_t> simple_packets_buffer;
+        boost::circular_buffer<fixed_size_packet_storage_t> raw_packets_buffer;
+
+        call_blackhole_actions_per_host(attack_action_t::unban, zero_ipv4_ip_address, itr.first, true, itr.second,
+                                        attack_detection_source_t::Automatic, flow_attack_details,
+                                        simple_packets_buffer, raw_packets_buffer);
     }
 
     // Remove all unbanned hosts from the ban list
     for (auto ban_element_for_erase : ban_list_items_for_erase) {
-        ban_list_ipv6_ng.remove_from_blackhole(ban_element_for_erase);
+        ban_list_ipv6.remove_from_blackhole(ban_element_for_erase);
     }
 }
 
@@ -716,179 +866,46 @@ void cleanup_ban_list() {
         time_t current_time;
         time(&current_time);
 
-        std::vector<uint32_t> ban_list_items_for_erase;
-
-        for (std::map<uint32_t, banlist_item_t>::iterator itr = ban_list.begin(); itr != ban_list.end(); ++itr) {
-            uint32_t client_ip = itr->first;
-
-            // This IP should be banned permanentely and we skip any processing
-            if (!itr->second.unban_enabled) {
-                continue;
-            }
-
-            double time_difference = difftime(current_time, itr->second.ban_timestamp);
-            int ban_time           = itr->second.ban_time;
-
-            // Yes, we reached end of ban time for this customer
-            bool we_could_unban_this_ip = time_difference > ban_time;
-
-            // We haven't reached time for unban yet
-            if (!we_could_unban_this_ip) {
-                continue;
-            }
-
-            // Check about ongoing attack
-            if (unban_only_if_attack_finished) {
-                std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-
-                uint32_t subnet_in_host_byte_order = ntohl(itr->second.customer_network.subnet_address);
-                int64_t shift_in_vector            = (int64_t)ntohl(client_ip) - (int64_t)subnet_in_host_byte_order;
-
-                // Try to find average speed element
-                map_of_vector_counters_t::iterator itr_average_speed =
-                    SubnetVectorMapSpeedAverage.find(itr->second.customer_network);
-
-                if (itr_average_speed == SubnetVectorMapSpeedAverage.end()) {
-                    logger << log4cpp::Priority::ERROR << "Can't find vector address in subnet map for unban function";
-                    continue;
-                }
-
-                if (shift_in_vector < 0 or shift_in_vector >= itr_average_speed->second.size()) {
-                    logger << log4cpp::Priority::ERROR << "We tried to access to element with index " << shift_in_vector
-                           << " which located outside allocated vector with size " << itr_average_speed->second.size();
-
-                    continue;
-                }
-
-                subnet_counter_t& average_speed_element = itr_average_speed->second[shift_in_vector];
-
-                // We get ban settings from host subnet
-                std::string host_group_name;
-                ban_settings_t current_ban_settings =
-                    get_ban_settings_for_this_subnet(itr->second.customer_network, host_group_name);
-
-                attack_detection_threshold_type_t attack_detection_source;
-                attack_detection_direction_type_t attack_detection_direction;
-
-                if (we_should_ban_this_entity(average_speed_element, current_ban_settings, attack_detection_source,
-                                              attack_detection_direction)) {
-                    logger << log4cpp::Priority::ERROR << "Attack to IP " << client_ip_as_string
-                           << " still going! We should not unblock this host";
-
-                    // Well, we still saw attack, skip to next iteration
-                    continue;
-                }
-            }
-
-            // Add this IP to remove list
-            // We will remove keyas really after this loop
-            ban_list_items_for_erase.push_back(itr->first);
-
-            // Call all hooks for unban
-            subnet_ipv6_cidr_mask_t zero_ipv6_address;
-            call_unban_handlers(itr->first, zero_ipv6_address, false, itr->second, attack_detection_source_t::Automatic);
-        }
-
-        // Remove all unbanned hosts from the ban list
-        for (std::vector<uint32_t>::iterator itr = ban_list_items_for_erase.begin(); itr != ban_list_items_for_erase.end(); ++itr) {
-            std::lock_guard<std::mutex> lock_guard(ban_list_mutex);
-            ban_list.erase(*itr);
-        }
+        execute_unban_operation_ipv4(); 
 
         // Unban IPv6 bans
         execute_unban_operation_ipv6();
     }
 }
 
-void call_unban_handlers(uint32_t client_ip,
-                         subnet_ipv6_cidr_mask_t client_ipv6,
-                         bool ipv6,
-                         attack_details_t& current_attack,
-                         attack_detection_source_t attack_detection_source) {
-    bool ipv4 = !ipv6;
-
-    std::string client_ip_as_string;
-
-    if (ipv4) {
-        client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-    } else {
-        client_ip_as_string = print_ipv6_address(client_ipv6.subnet_address);
-    }
-
-    logger << log4cpp::Priority::INFO << "We will unban banned IP: " << client_ip_as_string << " because it ban time "
-           << current_attack.ban_time << " seconds is ended";
-
-    if (notify_script_enabled) {
-        std::string data_direction_as_string = get_direction_name(current_attack.attack_direction);
-        std::string pps_as_string            = convert_int_to_string(current_attack.attack_power);
-
-        std::string script_call_params = fastnetmon_platform_configuration.notify_script_path + " " + client_ip_as_string +
-                                         " " + data_direction_as_string + " " + pps_as_string + " unban";
-
-        logger << log4cpp::Priority::INFO << "Call script for unban client: " << client_ip_as_string;
-
-        // We should execute external script in separate thread because any lag in this
-        // code will be very distructive
-        boost::thread exec_thread(exec_no_error_check, script_call_params);
-        exec_thread.detach();
-
-        logger << log4cpp::Priority::INFO << "Script for unban client is finished: " << client_ip_as_string;
-    }
-
-    if (exabgp_enabled && ipv4) {
-        logger << log4cpp::Priority::INFO << "Call ExaBGP for unban client started: " << client_ip_as_string;
-
-        boost::thread exabgp_thread(exabgp_ban_manage, "unban", client_ip_as_string, current_attack);
-        exabgp_thread.detach();
-
-        logger << log4cpp::Priority::INFO << "Call to ExaBGP for unban client is finished: " << client_ip_as_string;
-    }
-
-#ifdef ENABLE_GOBGP
-    if (gobgp_enabled) {
-        logger << log4cpp::Priority::INFO << "Call GoBGP for unban client started: " << client_ip_as_string;
-
-        boost::thread gobgp_thread(gobgp_ban_manage, "unban", ipv6, client_ip_as_string, client_ipv6, current_attack);
-        gobgp_thread.detach();
-
-        logger << log4cpp::Priority::INFO << "Call to GoBGP for unban client is finished: " << client_ip_as_string;
-    }
-#endif
-}
-
+// This code is a source of race conditions of worst kind, we had to rework it ASAP
 std::string print_ddos_attack_details() {
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
     std::stringstream output_buffer;
 
-    for (std::map<uint32_t, banlist_item_t>::iterator ii = ban_list.begin(); ii != ban_list.end(); ++ii) {
-        uint32_t client_ip = (*ii).first;
+    std::map<uint32_t, banlist_item_t> ban_list_ipv4_copy;
+
+    // Get whole ban list content atomically
+    ban_list_ipv4.get_whole_banlist(ban_list_ipv4_copy);
+
+    for (auto itr : ban_list_ipv4_copy) {
+        uint32_t client_ip = itr.first;
 
         std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-        std::string max_pps_as_string   = convert_int_to_string(((*ii).second).max_attack_power);
-        std::string attack_direction    = get_direction_name(((*ii).second).attack_direction);
 
-        output_buffer << client_ip_as_string << "/" << max_pps_as_string << " pps " << attack_direction << " at "
-                      << print_time_t_in_fastnetmon_format(ii->second.ban_timestamp) << std::endl;
-
-        send_attack_details(client_ip, (*ii).second);
+        output_buffer << client_ip_as_string << " at " << print_time_t_in_fastnetmon_format(itr.second.ban_timestamp) << std::endl;
     }
-
 
     return output_buffer.str();
 }
 
-std::string get_attack_description(uint32_t client_ip, attack_details_t& current_attack) {
+std::string get_attack_description(uint32_t client_ip, const attack_details_t& current_attack) {
     std::stringstream attack_description;
 
     attack_description << "IP: " << convert_ip_as_uint_to_string(client_ip) << "\n";
     attack_description << serialize_attack_description(current_attack) << "\n";
 
-    attack_description << serialize_statistic_counters_about_attack(current_attack);
-
     return attack_description.str();
 }
 
 // Serialises traffic counters to JSON
-bool serialize_traffic_counters_to_json(const attack_details_t& traffic_counters, nlohmann::json& json_details) {
+bool serialize_traffic_counters_to_json(const subnet_counter_t& traffic_counters, nlohmann::json& json_details) {
     try {
         json_details["total_incoming_traffic"]      = traffic_counters.total.in_bytes;
         json_details["total_incoming_traffic_bits"] = traffic_counters.total.in_bytes * 8;
@@ -965,6 +982,7 @@ bool serialize_traffic_counters_to_json(const attack_details_t& traffic_counters
     return true;
 }
 
+
 bool serialize_attack_description_to_json(const attack_details_t& current_attack, nlohmann::json& json_details) {
     // We need to catch exceptions as code may raise them here
     try {
@@ -976,7 +994,7 @@ bool serialize_attack_description_to_json(const attack_details_t& current_attack
         return false;
     }
 
-    if (!serialize_traffic_counters_to_json(current_attack, json_details)) {
+    if (!serialize_traffic_counters_to_json(current_attack.traffic_counters, json_details)) {
         logger << log4cpp::Priority::ERROR << "Cannot add traffic counters to JSON document";
         return false;
     }
@@ -1017,115 +1035,12 @@ std::string get_attack_description_in_json_for_web_hooks(uint32_t client_ip,
     return json_as_text;
 }
 
-std::string generate_simple_packets_dump(std::vector<simple_packet_t>& ban_list_details) {
-    std::stringstream attack_details;
-
-    std::map<unsigned int, unsigned int> protocol_counter;
-    for (std::vector<simple_packet_t>::iterator iii = ban_list_details.begin(); iii != ban_list_details.end(); ++iii) {
-        attack_details << print_simple_packet(*iii);
-
-        protocol_counter[iii->protocol]++;
-    }
-
-    return attack_details.str();
-}
-
-void send_attack_details(uint32_t client_ip, attack_details_t current_attack_details) {
-    std::string pps_as_string       = convert_int_to_string(current_attack_details.attack_power);
-    std::string attack_direction    = get_direction_name(current_attack_details.attack_direction);
-    std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-
-    // In this case we do not collect any traffic samples
-    if (ban_details_records_count == 0) {
-        return;
-    }
-
-    // Very strange code but it work in 95% cases
-    if (ban_list_details.count(client_ip) > 0 && ban_list_details[client_ip].size() >= ban_details_records_count) {
-        std::stringstream attack_details;
-
-        attack_details << get_attack_description(client_ip, current_attack_details) << "\n\n";
-        attack_details << generate_simple_packets_dump(ban_list_details[client_ip]);
-
-        logger << log4cpp::Priority::INFO << "Attack with direction: " << attack_direction
-               << " IP: " << client_ip_as_string << " Power: " << pps_as_string << " traffic samples collected";
-
-        call_attack_details_handlers(client_ip, current_attack_details, attack_details.str());
-
-        // TODO: here we have definitely RACE CONDITION!!! FIX IT
-
-        // Remove key and prevent collection new data about this attack
-        std::lock_guard<std::mutex> lock_guard(ban_list_details_mutex);
-        ban_list_details.erase(client_ip);
-    }
-}
-
-void call_attack_details_handlers(uint32_t client_ip, attack_details_t& current_attack, std::string attack_fingerprint) {
-    std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-    std::string attack_direction    = get_direction_name(current_attack.attack_direction);
-    std::string pps_as_string       = convert_int_to_string(current_attack.attack_power);
-
-    std::string ban_timestamp_as_string = print_time_t_in_fastnetmon_format(current_attack.ban_timestamp);
-    std::string attack_pcap_dump_path   = fastnetmon_platform_configuration.attack_details_folder + "/" +
-                                        client_ip_as_string + "_" + ban_timestamp_as_string + ".pcap";
-
-    if (collect_attack_pcap_dumps) {
-        int pcap_fump_filedesc = open(attack_pcap_dump_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
-        if (pcap_fump_filedesc <= 0) {
-            logger << log4cpp::Priority::ERROR << "Can't open file for storing pcap dump: " << attack_pcap_dump_path;
-        } else {
-            ssize_t wrote_bytes = write(pcap_fump_filedesc, (void*)current_attack.pcap_attack_dump.get_buffer_pointer(),
-                                        current_attack.pcap_attack_dump.get_used_memory());
-
-            if (wrote_bytes != current_attack.pcap_attack_dump.get_used_memory()) {
-                logger << log4cpp::Priority::ERROR << "Can't wrote all attack details to the disk correctly";
-            }
-
-            close(pcap_fump_filedesc);
-
-            // Freeup memory
-            current_attack.pcap_attack_dump.deallocate_buffer();
-        }
-    }
-
-    print_attack_details_to_file(attack_fingerprint, client_ip_as_string, current_attack);
-
-    // Pass attack details to script
-    if (notify_script_enabled) {
-        logger << log4cpp::Priority::INFO << "Call script for notify about attack details for: " << client_ip_as_string;
-
-        std::string script_params = fastnetmon_platform_configuration.notify_script_path + " " + client_ip_as_string +
-                                    " " + attack_direction + " " + pps_as_string + " attack_details";
-
-        // We should execute external script in separate thread because any lag in this code
-        // will be very destructive
-        boost::thread exec_with_params_thread(exec_with_stdin_params, script_params, attack_fingerprint);
-        exec_with_params_thread.detach();
-
-        logger << log4cpp::Priority::INFO << "Script for notify about attack details is finished: " << client_ip_as_string;
-    }
-
-#ifdef REDIS
-    if (redis_enabled) {
-        std::string redis_key_name = client_ip_as_string + "_packets_dump";
-
-        if (!redis_prefix.empty()) {
-            redis_key_name = redis_prefix + "_" + client_ip_as_string + "_packets_dump";
-        }
-
-        logger << log4cpp::Priority::INFO << "Start data save in redis for key: " << redis_key_name;
-        boost::thread redis_store_thread(store_data_in_redis, redis_key_name, attack_fingerprint);
-        redis_store_thread.detach();
-        logger << log4cpp::Priority::INFO << "Finish data save in redis for key: " << redis_key_name;
-    }
-#endif
-}
-
-uint64_t convert_conntrack_hash_struct_to_integer(packed_conntrack_hash_t* struct_value) {
+uint64_t convert_conntrack_hash_struct_to_integer(const packed_conntrack_hash_t& struct_value) {
     uint64_t unpacked_data = 0;
-    memcpy(&unpacked_data, struct_value, sizeof(uint64_t));
+    memcpy(&unpacked_data, &struct_value, sizeof(uint64_t));
     return unpacked_data;
 }
+
 
 /*
     Attack types:
@@ -1142,7 +1057,7 @@ bool process_flow_tracking_table(conntrack_main_struct_t& conntrack_element, std
     for (contrack_map_type::iterator itr = conntrack_element.in_tcp.begin(); itr != conntrack_element.in_tcp.end(); ++itr) {
         uint64_t packed_connection_data = itr->first;
         packed_conntrack_hash_t unpacked_key_struct;
-        convert_integer_to_conntrack_hash_struct(&packed_connection_data, &unpacked_key_struct);
+        convert_integer_to_conntrack_hash_struct(packed_connection_data, unpacked_key_struct);
 
         uniq_remote_hosts_which_generate_requests_to_us[unpacked_key_struct.opposite_ip]++;
         uniq_local_ports_which_target_of_connectiuons_from_inside[unpacked_key_struct.dst_port]++;
@@ -1192,7 +1107,7 @@ bool exec_with_stdin_params(std::string cmd, std::string params) {
 }
 
 // Get ban settings for this subnet or return global ban settings
-ban_settings_t get_ban_settings_for_this_subnet(subnet_cidr_mask_t subnet, std::string& host_group_name) {
+ban_settings_t get_ban_settings_for_this_subnet(const subnet_cidr_mask_t& subnet, std::string& host_group_name) {
     // Try to find host group for this subnet
     subnet_to_host_group_map_t::iterator host_group_itr = subnet_to_host_groups.find(subnet);
 
@@ -1206,7 +1121,7 @@ ban_settings_t get_ban_settings_for_this_subnet(subnet_cidr_mask_t subnet, std::
     host_group_name = host_group_itr->second;
 
     // We found host group for this subnet
-    host_group_ban_settings_map_t::iterator hostgroup_settings_itr = host_group_ban_settings_map.find(host_group_itr->second);
+    auto hostgroup_settings_itr = host_group_ban_settings_map.find(host_group_itr->second);
 
     if (hostgroup_settings_itr == host_group_ban_settings_map.end()) {
         logger << log4cpp::Priority::ERROR << "We can't find ban settings for host group " << host_group_itr->second;
@@ -1267,179 +1182,15 @@ redisContext* redis_init_connection() {
 
 #endif
 
-
-void execute_ip_ban(uint32_t client_ip, subnet_counter_t average_speed_element, std::string flow_attack_details, subnet_cidr_mask_t customer_subnet) {
-    attack_details_t current_attack;
-    uint64_t pps = 0;
-
-    uint64_t in_pps    = average_speed_element.total.in_packets;
-    uint64_t out_pps   = average_speed_element.total.out_packets;
-    uint64_t in_bps    = average_speed_element.total.in_bytes;
-    uint64_t out_bps   = average_speed_element.total.out_bytes;
-    uint64_t in_flows  = average_speed_element.in_flows;
-    uint64_t out_flows = average_speed_element.out_flows;
-
-    direction_t data_direction;
-
-    if (!global_ban_settings.enable_ban) {
-        logger << log4cpp::Priority::INFO << "We do not ban: " << convert_ip_as_uint_to_string(client_ip)
-               << " because ban disabled completely";
-        return;
-    }
-
-    // Detect attack direction with simple heuristic
-    if (abs(int((int)in_pps - (int)out_pps)) < 1000) {
-        // If difference between pps speed is so small we should do additional investigation using
-        // bandwidth speed
-        if (in_bps > out_bps) {
-            data_direction = INCOMING;
-            pps            = in_pps;
-        } else {
-            data_direction = OUTGOING;
-            pps            = out_pps;
-        }
-    } else {
-        if (in_pps > out_pps) {
-            data_direction = INCOMING;
-            pps            = in_pps;
-        } else {
-            data_direction = OUTGOING;
-            pps            = out_pps;
-        }
-    }
-
-    current_attack.attack_protocol = detect_attack_protocol(average_speed_element, data_direction);
-
-    if (ban_list.count(client_ip) > 0) {
-        if (ban_list[client_ip].attack_direction != data_direction) {
-            logger << log4cpp::Priority::INFO << "We expected very strange situation: attack direction for "
-                   << convert_ip_as_uint_to_string(client_ip) << " was changed";
-
-            return;
-        }
-
-        // update attack power
-        if (pps > ban_list[client_ip].max_attack_power) {
-            ban_list[client_ip].max_attack_power = pps;
-        }
-
-        return;
-    }
-
-    prefix_t prefix_for_check_adreess;
-    prefix_for_check_adreess.add.sin.s_addr = client_ip;
-    prefix_for_check_adreess.family         = AF_INET;
-    prefix_for_check_adreess.bitlen         = 32;
-
-    bool in_white_list = (patricia_search_best2(whitelist_tree_ipv4, &prefix_for_check_adreess, 1) != NULL);
-
-    if (in_white_list) {
-        return;
-    }
-
-    std::string data_direction_as_string = get_direction_name(data_direction);
-
-    logger << log4cpp::Priority::INFO << "We run execute_ip_ban code with following params "
-           << " in_pps: " << in_pps << " out_pps: " << out_pps << " in_bps: " << in_bps << " out_bps: " << out_bps
-           << " and we decide it's " << data_direction_as_string << " attack";
-
-    std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
-    std::string pps_as_string       = convert_int_to_string(pps);
-
-    // Store information about subnet
-    current_attack.customer_network = customer_subnet;
-
-    // Store ban time
-    time(&current_attack.ban_timestamp);
-    // set ban time in seconds
-    current_attack.ban_time      = global_ban_time;
-    current_attack.unban_enabled = unban_enabled;
-
-    // Pass main information about attack
-    current_attack.attack_direction = data_direction;
-    current_attack.attack_power     = pps;
-    current_attack.max_attack_power = pps;
-
-    current_attack.total.in_packets  = in_pps;
-    current_attack.total.out_packets = out_pps;
-
-    current_attack.total.in_bytes  = in_bps;
-    current_attack.total.out_bytes = out_bps;
-
-    // pass flow information
-    current_attack.in_flows  = in_flows;
-    current_attack.out_flows = out_flows;
-
-    current_attack.fragmented.in_packets = average_speed_element.fragmented.in_packets;
-    current_attack.tcp.in_packets        = average_speed_element.tcp.in_packets;
-    current_attack.tcp_syn.in_packets    = average_speed_element.tcp_syn.in_packets;
-    current_attack.udp.in_packets        = average_speed_element.udp.in_packets;
-    current_attack.icmp.in_packets       = average_speed_element.icmp.in_packets;
-
-    current_attack.fragmented.out_packets = average_speed_element.fragmented.out_packets;
-    current_attack.tcp.out_packets        = average_speed_element.tcp.out_packets;
-    current_attack.tcp_syn.out_packets    = average_speed_element.tcp_syn.out_packets;
-    current_attack.udp.out_packets        = average_speed_element.udp.out_packets;
-    current_attack.icmp.out_packets       = average_speed_element.icmp.out_packets;
-
-    current_attack.fragmented.out_bytes = average_speed_element.fragmented.out_bytes;
-    current_attack.tcp.out_bytes        = average_speed_element.tcp.out_bytes;
-    current_attack.tcp_syn.out_bytes    = average_speed_element.tcp_syn.out_bytes;
-    current_attack.udp.out_bytes        = average_speed_element.udp.out_bytes;
-    current_attack.icmp.out_bytes       = average_speed_element.icmp.out_bytes;
-
-    current_attack.fragmented.in_bytes = average_speed_element.fragmented.in_bytes;
-    current_attack.tcp.in_bytes        = average_speed_element.tcp.in_bytes;
-    current_attack.tcp_syn.in_bytes    = average_speed_element.tcp_syn.in_bytes;
-    current_attack.udp.in_bytes        = average_speed_element.udp.in_bytes;
-    current_attack.icmp.in_bytes       = average_speed_element.icmp.in_bytes;
-
-    current_attack.average_in_packets = average_speed_element.total.in_packets;
-    current_attack.average_in_bytes   = average_speed_element.total.in_bytes;
-    current_attack.average_in_flows   = average_speed_element.in_flows;
-
-    current_attack.average_out_packets = average_speed_element.total.out_packets;
-    current_attack.average_out_bytes   = average_speed_element.total.out_bytes;
-    current_attack.average_out_flows   = average_speed_element.out_flows;
-
-    if (collect_attack_pcap_dumps) {
-        bool buffer_allocation_result = current_attack.pcap_attack_dump.allocate_buffer(number_of_packets_for_pcap_attack_dump);
-
-        if (!buffer_allocation_result) {
-            logger << log4cpp::Priority::ERROR << "Can't allocate buffer for attack, switch off this option completely ";
-            collect_attack_pcap_dumps = false;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock_guard(ban_list_mutex);
-        ban_list[client_ip] = current_attack;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock_guard(ban_list_details_mutex);
-        ban_list_details[client_ip] = std::vector<simple_packet_t>();
-    }
-
-    logger << log4cpp::Priority::INFO << "Attack with direction: " << data_direction_as_string
-           << " IP: " << client_ip_as_string << " Power: " << pps_as_string;
-
-    subnet_ipv6_cidr_mask_t zero_ipv6_address;
-
-    boost::circular_buffer<simple_packet_t> empty_simple_packets_buffer;
-
-    call_ban_handlers(client_ip, zero_ipv6_address, false, ban_list[client_ip], flow_attack_details,
-                      attack_detection_source_t::Automatic, "", empty_simple_packets_buffer);
-}
-
-void call_ban_handlers(uint32_t client_ip,
-                       subnet_ipv6_cidr_mask_t client_ipv6,
-                       bool ipv6,
-                       attack_details_t& current_attack,
-                       std::string flow_attack_details,
-                       attack_detection_source_t attack_detection_source,
-                       std::string simple_packets_dump,
-                       boost::circular_buffer<simple_packet_t>& simple_packets_buffer) {
+void call_blackhole_actions_per_host(attack_action_t attack_action,
+                                     uint32_t client_ip,
+                                     const subnet_ipv6_cidr_mask_t& client_ipv6,
+                                     bool ipv6,
+                                     const attack_details_t& current_attack,
+                                     attack_detection_source_t attack_detection_source,
+                                     const std::string& flow_attack_details,
+                                     const boost::circular_buffer<simple_packet_t>& simple_packets_buffer,
+                                     const boost::circular_buffer<fixed_size_packet_storage_t>& raw_packets_buffer) { 
 
     bool ipv4                       = !ipv6;
     std::string client_ip_as_string = "";
@@ -1450,101 +1201,137 @@ void call_ban_handlers(uint32_t client_ip,
         client_ip_as_string = print_ipv6_address(client_ipv6.subnet_address);
     }
 
+    std::string action_name;
 
-    std::string pps_as_string            = convert_int_to_string(current_attack.attack_power);
-    std::string data_direction_as_string = get_direction_name(current_attack.attack_direction);
+    if (attack_action == attack_action_t::ban) {
+        action_name = "ban";
+    } else if (attack_action == attack_action_t::unban) {
+        action_name = "unban";
+    }
+
+    std::string simple_packets_dump;
+    print_simple_packet_buffer_to_string(simple_packets_buffer, simple_packets_dump);
+
+    std::string basic_attack_information_in_json =
+        get_attack_description_in_json_for_web_hooks(client_ip, subnet_ipv6_cidr_mask_t{}, false, action_name, current_attack);
 
     bool store_attack_details_to_file = true;
 
-    std::string basic_attack_information = get_attack_description(client_ip, current_attack);
+    if (store_attack_details_to_file && attack_action == attack_action_t::ban) {
+        std::string basic_attack_information = get_attack_description(client_ip, current_attack);
 
-    std::string basic_attack_information_in_json =
-        get_attack_description_in_json_for_web_hooks(client_ip, subnet_ipv6_cidr_mask_t{}, false, "ban", current_attack);
+        std::string full_attack_description = basic_attack_information + "\n\nAttack traffic dump\n\n" + simple_packets_dump + "\n\nFlow dump\n\n" + flow_attack_details;
 
-    std::string full_attack_description = basic_attack_information + flow_attack_details;
-
-    if (store_attack_details_to_file && ipv4) {
-        print_attack_details_to_file(full_attack_description, client_ip_as_string, current_attack);
+        if (store_attack_details_to_file) {
+            print_attack_details_to_file(full_attack_description, client_ip_as_string, current_attack);
+        }
     }
 
     if (notify_script_enabled) {
-        std::string script_call_params = fastnetmon_platform_configuration.notify_script_path + " " + client_ip_as_string +
-                                         " " + data_direction_as_string + " " + pps_as_string + " " + "ban";
-        logger << log4cpp::Priority::INFO << "Call script for ban client: " << client_ip_as_string;
+        std::string pps_as_string            = convert_int_to_string(current_attack.attack_power);
+        std::string data_direction_as_string = get_direction_name(current_attack.attack_direction);
 
-        // We should execute external script in separate thread because any lag in this code will be
-        // very destructive
+        if (attack_action == attack_action_t::ban) {
+            std::string basic_attack_information = get_attack_description(client_ip, current_attack);
 
-        // We will pass attack details over stdin
-        boost::thread exec_thread(exec_with_stdin_params, script_call_params, full_attack_description);
-        exec_thread.detach();
+            std::string full_attack_description = basic_attack_information + "\n\nAttack traffic dump\n\n" + simple_packets_dump + "\n\nFlow dump\n\n" + flow_attack_details;
 
-        logger << log4cpp::Priority::INFO << "Script for ban client is finished: " << client_ip_as_string;
+            std::string script_call_params = fastnetmon_platform_configuration.notify_script_path + " " + client_ip_as_string +
+                                             " " + data_direction_as_string + " " + pps_as_string + " " + "ban";
+            
+            logger << log4cpp::Priority::INFO << "Call script for ban client: " << client_ip_as_string;
+
+            // We should execute external script in separate thread because any lag in this code will be
+            // very destructive
+
+            // We will pass attack details over stdin
+            boost::thread exec_thread(exec_with_stdin_params, script_call_params, full_attack_description);
+            exec_thread.detach();
+
+            logger << log4cpp::Priority::INFO << "Script for ban client is finished: " << client_ip_as_string;
+        } else if (attack_action == attack_action_t::unban) {
+            std::string script_call_params = fastnetmon_platform_configuration.notify_script_path + " " + client_ip_as_string +
+                                             " " + data_direction_as_string + " " + pps_as_string + " unban";
+
+            logger << log4cpp::Priority::INFO << "Call script for unban client: " << client_ip_as_string;
+
+            // We should execute external script in separate thread because any lag in this
+            // code will be very distructive
+            boost::thread exec_thread(exec_no_error_check, script_call_params);
+            exec_thread.detach();
+
+            logger << log4cpp::Priority::INFO << "Script for unban client is finished: " << client_ip_as_string;
+        }
     }
 
     if (exabgp_enabled && ipv4) {
-        logger << log4cpp::Priority::INFO << "Call ExaBGP for ban client started: " << client_ip_as_string;
+        logger << log4cpp::Priority::INFO << "Call ExaBGP for " << action_name << " client started: " << client_ip_as_string;
 
-        boost::thread exabgp_thread(exabgp_ban_manage, "ban", client_ip_as_string, current_attack);
+        boost::thread exabgp_thread(exabgp_ban_manage, action_name, client_ip_as_string, current_attack.customer_network);
         exabgp_thread.detach();
 
-        logger << log4cpp::Priority::INFO << "Call to ExaBGP for ban client is finished: " << client_ip_as_string;
+        logger << log4cpp::Priority::INFO << "Call to ExaBGP for " << action_name << "client is finished: " << client_ip_as_string;
     }
 
 #ifdef ENABLE_GOBGP
     if (gobgp_enabled) {
-        logger << log4cpp::Priority::INFO << "Call GoBGP for ban client started: " << client_ip_as_string;
+        logger << log4cpp::Priority::INFO << "Call GoBGP for " << action_name << " client started: " << client_ip_as_string;
 
-        boost::thread gobgp_thread(gobgp_ban_manage, "ban", ipv6, client_ip_as_string, client_ipv6, current_attack);
+        boost::thread gobgp_thread(gobgp_ban_manage, action_name, ipv6, client_ip_as_string, client_ipv6, current_attack.customer_network);
         gobgp_thread.detach();
 
-        logger << log4cpp::Priority::INFO << "Call to GoBGP for ban client is finished: " << client_ip_as_string;
+        logger << log4cpp::Priority::INFO << "Call to GoBGP for " << action_name << " client is finished: " << client_ip_as_string;
     }
 #endif
 
+    if (attack_action == attack_action_t::ban) { 
 #ifdef REDIS
-    if (redis_enabled && ipv4) {
-        std::string redis_key_name = client_ip_as_string + "_information";
-
-        if (!redis_prefix.empty()) {
-            redis_key_name = redis_prefix + "_" + client_ip_as_string + "_information";
-        }
-
-        logger << log4cpp::Priority::INFO << "Start data save in Redis in key: " << redis_key_name;
-        boost::thread redis_store_thread(store_data_in_redis, redis_key_name, basic_attack_information_in_json);
-        redis_store_thread.detach();
-        logger << log4cpp::Priority::INFO << "Finish data save in Redis in key: " << redis_key_name;
-
-        // If we have flow dump put in redis too
-        if (!flow_attack_details.empty()) {
-            std::string redis_key_name = client_ip_as_string + "_flow_dump";
+        if (redis_enabled && ipv4) {
+            std::string redis_key_name = client_ip_as_string + "_information";
 
             if (!redis_prefix.empty()) {
-                redis_key_name = redis_prefix + "_" + client_ip_as_string + "_flow_dump";
+                redis_key_name = redis_prefix + "_" + client_ip_as_string + "_information";
             }
 
-            logger << log4cpp::Priority::INFO << "Start data save in redis in key: " << redis_key_name;
-            boost::thread redis_store_thread(store_data_in_redis, redis_key_name, flow_attack_details);
+            logger << log4cpp::Priority::INFO << "Start data save in Redis in key: " << redis_key_name;
+            boost::thread redis_store_thread(store_data_in_redis, redis_key_name, basic_attack_information_in_json);
             redis_store_thread.detach();
-            logger << log4cpp::Priority::INFO << "Finish data save in redis in key: " << redis_key_name;
+            logger << log4cpp::Priority::INFO << "Finish data save in Redis in key: " << redis_key_name;
+
+            // If we have flow dump put in redis too
+            if (!flow_attack_details.empty()) {
+                std::string redis_key_name = client_ip_as_string + "_flow_dump";
+
+                if (!redis_prefix.empty()) {
+                    redis_key_name = redis_prefix + "_" + client_ip_as_string + "_flow_dump";
+                }
+
+                logger << log4cpp::Priority::INFO << "Start data save in redis in key: " << redis_key_name;
+                boost::thread redis_store_thread(store_data_in_redis, redis_key_name, flow_attack_details);
+                redis_store_thread.detach();
+                logger << log4cpp::Priority::INFO << "Finish data save in redis in key: " << redis_key_name;
+            }
+
         }
-    }
 #endif
+    }
 
+    if (attack_action == attack_action_t::ban) { 
 #ifdef MONGO
-    if (mongodb_enabled && ipv4) {
-        std::string mongo_key_name =
-            client_ip_as_string + "_information_" + print_time_t_in_fastnetmon_format(current_attack.ban_timestamp);
+        if (mongodb_enabled && ipv4) {
+            std::string mongo_key_name =
+                client_ip_as_string + "_information_" + print_time_t_in_fastnetmon_format(current_attack.ban_timestamp);
 
-        // We could not use dot in key names: http://docs.mongodb.org/manual/core/document/#dot-notation
-        std::replace(mongo_key_name.begin(), mongo_key_name.end(), '.', '_');
+            // We could not use dot in key names: http://docs.mongodb.org/manual/core/document/#dot-notation
+            std::replace(mongo_key_name.begin(), mongo_key_name.end(), '.', '_');
 
-        logger << log4cpp::Priority::INFO << "Start data save in Mongo in key: " << mongo_key_name;
-        boost::thread mongo_store_thread(store_data_in_mongo, mongo_key_name, basic_attack_information_in_json);
-        mongo_store_thread.detach();
-        logger << log4cpp::Priority::INFO << "Finish data save in Mongo in key: " << mongo_key_name;
-    }
+            logger << log4cpp::Priority::INFO << "Start data save in Mongo in key: " << mongo_key_name;
+            boost::thread mongo_store_thread(store_data_in_mongo, mongo_key_name, basic_attack_information_in_json);
+            mongo_store_thread.detach();
+            logger << log4cpp::Priority::INFO << "Finish data save in Mongo in key: " << mongo_key_name;
+        }
 #endif
+    }
 }
 
 
@@ -1650,21 +1437,22 @@ void traffic_draw_ipv6_program() {
         sorter_type = attack_detection_threshold_type_t::packets_per_second;
     }
 
-    output_buffer << "FastNetMon " << fastnetmon_platform_configuration.fastnetmon_version << " Try Advanced edition: https://fastnetmon.com/product-overview/"
+    output_buffer << "FastNetMon " << fastnetmon_platform_configuration.fastnetmon_version
+                  << " Try Advanced edition: https://fastnetmon.com/product-overview/"
                   << "\n"
                   << "IPs ordered by: " << sort_parameter << "\n";
 
     output_buffer << print_channel_speed_ipv6("Incoming traffic", INCOMING) << std::endl;
 
     if (process_incoming_traffic) {
-        output_buffer << draw_table_ipv6(attack_detection_direction_type_t::incoming, true, sorter_type);
+        output_buffer << draw_table_ipv6(attack_detection_direction_type_t::incoming, sorter_type);
         output_buffer << std::endl;
     }
 
     output_buffer << print_channel_speed_ipv6("Outgoing traffic", OUTGOING) << std::endl;
 
     if (process_outgoing_traffic) {
-        output_buffer << draw_table_ipv6(attack_detection_direction_type_t::outgoing, false, sorter_type);
+        output_buffer << draw_table_ipv6(attack_detection_direction_type_t::outgoing, sorter_type);
         output_buffer << std::endl;
     }
 
@@ -1678,42 +1466,6 @@ void traffic_draw_ipv6_program() {
 
     // Print screen contents into file
     print_screen_contents_into_file(output_buffer.str(), cli_stats_ipv6_file_path);
-}
-
-std::string print_subnet_ipv6_load() {
-    std::stringstream buffer;
-
-    attack_detection_threshold_type_t sorter_type;
-
-    if (sort_parameter == "packets") {
-        sorter_type = attack_detection_threshold_type_t::packets_per_second;
-    } else if (sort_parameter == "bytes") {
-        sorter_type = attack_detection_threshold_type_t::bytes_per_second;
-    } else if (sort_parameter == "flows") {
-        sorter_type = attack_detection_threshold_type_t::flows_per_second;
-    } else {
-        logger << log4cpp::Priority::INFO << "Unexpected sorter type: " << sort_parameter;
-        sorter_type = attack_detection_threshold_type_t::packets_per_second;
-    }
-
-    std::vector<pair_of_map_for_ipv6_subnet_counters_elements_t> vector_for_sort;
-    ipv6_subnet_counters.get_sorted_average_speed(vector_for_sort, sorter_type, attack_detection_direction_type_t::outgoing);
-
-
-    for (std::vector<pair_of_map_for_ipv6_subnet_counters_elements_t>::iterator itr = vector_for_sort.begin();
-         itr != vector_for_sort.end(); ++itr) {
-        subnet_counter_t* speed      = &itr->second;
-        std::string subnet_as_string = print_ipv6_cidr_subnet(itr->first);
-
-        buffer << std::setw(42) << std::left << subnet_as_string;
-
-        buffer << " "
-               << "pps in: " << std::setw(8) << speed->total.in_packets << " out: " << std::setw(8)
-               << speed->total.out_packets << " mbps in: " << std::setw(5) << convert_speed_to_mbps(speed->total.in_bytes)
-               << " out: " << std::setw(5) << convert_speed_to_mbps(speed->total.out_bytes) << "\n";
-    }
-
-    return buffer.str();
 }
 
 void traffic_draw_ipv4_program() {
@@ -1735,21 +1487,24 @@ void traffic_draw_ipv4_program() {
         sorter_type = attack_detection_threshold_type_t::packets_per_second;
     }
 
-    output_buffer << "FastNetMon " << fastnetmon_platform_configuration.fastnetmon_version << " Try Advanced edition: https://fastnetmon.com/product-overview/"
+    output_buffer << "FastNetMon " << fastnetmon_platform_configuration.fastnetmon_version
+                  << " Try Advanced edition: https://fastnetmon.com/product-overview/"
                   << "\n"
                   << "IPs ordered by: " << sort_parameter << "\n";
 
     output_buffer << print_channel_speed("Incoming traffic", INCOMING) << std::endl;
 
     if (process_incoming_traffic) {
-        output_buffer << draw_table_ipv4(attack_detection_direction_type_t::incoming, true, sorter_type);
+        output_buffer << draw_table_ipv4_hash(attack_detection_direction_type_t::incoming, sorter_type);
+
         output_buffer << std::endl;
     }
 
     output_buffer << print_channel_speed("Outgoing traffic", OUTGOING) << std::endl;
 
     if (process_outgoing_traffic) {
-        output_buffer << draw_table_ipv4(attack_detection_direction_type_t::outgoing, false, sorter_type);
+        output_buffer << draw_table_ipv4_hash(attack_detection_direction_type_t::outgoing, sorter_type);
+
         output_buffer << std::endl;
     }
 
@@ -1769,15 +1524,8 @@ void traffic_draw_ipv4_program() {
 
     output_buffer << "Not processed packets: " << total_unparsed_packets_speed << " pps\n";
 
-    // Print backend stats
-    if (enable_pcap_collection) {
-        output_buffer << get_pcap_stats() << "\n";
-    }
-
-    if (!ban_list.empty()) {
-        output_buffer << std::endl << "Ban list:" << std::endl;
-        output_buffer << print_ddos_attack_details();
-    }
+    output_buffer << std::endl << "Ban list:" << std::endl;
+    output_buffer << print_ddos_attack_details();
 
     // Print screen contents into file
     print_screen_contents_into_file(output_buffer.str(), cli_stats_file_path);
@@ -1819,7 +1567,7 @@ std::string get_human_readable_threshold_type(attack_detection_threshold_type_t 
 
 
 // This function fills attack information from different information sources
-bool fill_attack_information(subnet_counter_t average_speed_element,
+bool fill_attack_information(
                              attack_details_t& current_attack,
                              std::string& host_group_name,
                              std::string& parent_host_group_name,
@@ -1827,12 +1575,10 @@ bool fill_attack_information(subnet_counter_t average_speed_element,
                              int ban_time) {
     uint64_t pps = 0;
 
-    uint64_t in_pps    = average_speed_element.total.in_packets;
-    uint64_t out_pps   = average_speed_element.total.out_packets;
-    uint64_t in_bps    = average_speed_element.total.in_bytes;
-    uint64_t out_bps   = average_speed_element.total.out_bytes;
-    uint64_t in_flows  = average_speed_element.in_flows;
-    uint64_t out_flows = average_speed_element.out_flows;
+    uint64_t in_pps    = current_attack.traffic_counters.total.in_packets;
+    uint64_t out_pps   = current_attack.traffic_counters.total.out_packets;
+    uint64_t in_bps    = current_attack.traffic_counters.total.in_bytes;
+    uint64_t out_bps   = current_attack.traffic_counters.total.out_bytes;
 
     direction_t data_direction;
 
@@ -1860,7 +1606,7 @@ bool fill_attack_information(subnet_counter_t average_speed_element,
         }
     }
 
-    current_attack.attack_protocol = detect_attack_protocol(average_speed_element, data_direction);
+    current_attack.attack_protocol = detect_attack_protocol(current_attack.traffic_counters, data_direction);
 
     current_attack.host_group        = host_group_name;
     current_attack.parent_host_group = parent_host_group_name;
@@ -1883,58 +1629,18 @@ bool fill_attack_information(subnet_counter_t average_speed_element,
     current_attack.attack_power     = pps;
     current_attack.max_attack_power = pps;
 
-    current_attack.total.in_packets  = in_pps;
-    current_attack.total.out_packets = out_pps;
-
-    current_attack.total.in_bytes  = in_bps;
-    current_attack.total.out_bytes = out_bps;
-
-    // pass flow information
-    current_attack.in_flows  = in_flows;
-    current_attack.out_flows = out_flows;
-
-    current_attack.fragmented.in_packets = average_speed_element.fragmented.in_packets;
-    current_attack.tcp.in_packets        = average_speed_element.tcp.in_packets;
-    current_attack.tcp_syn.in_packets    = average_speed_element.tcp_syn.in_packets;
-    current_attack.udp.in_packets        = average_speed_element.udp.in_packets;
-    current_attack.icmp.in_packets       = average_speed_element.icmp.in_packets;
-
-    current_attack.fragmented.out_packets = average_speed_element.fragmented.out_packets;
-    current_attack.tcp.out_packets        = average_speed_element.tcp.out_packets;
-    current_attack.tcp_syn.out_packets    = average_speed_element.tcp_syn.out_packets;
-    current_attack.udp.out_packets        = average_speed_element.udp.out_packets;
-    current_attack.icmp.out_packets       = average_speed_element.icmp.out_packets;
-
-    current_attack.fragmented.out_bytes = average_speed_element.fragmented.out_bytes;
-    current_attack.tcp.out_bytes        = average_speed_element.tcp.out_bytes;
-    current_attack.tcp_syn.out_bytes    = average_speed_element.tcp_syn.out_bytes;
-    current_attack.udp.out_bytes        = average_speed_element.udp.out_bytes;
-    current_attack.icmp.out_bytes       = average_speed_element.icmp.out_bytes;
-
-    current_attack.fragmented.in_bytes = average_speed_element.fragmented.in_bytes;
-    current_attack.tcp.in_bytes        = average_speed_element.tcp.in_bytes;
-    current_attack.tcp_syn.in_bytes    = average_speed_element.tcp_syn.in_bytes;
-    current_attack.udp.in_bytes        = average_speed_element.udp.in_bytes;
-    current_attack.icmp.in_bytes       = average_speed_element.icmp.in_bytes;
-
-    current_attack.average_in_packets = average_speed_element.total.in_packets;
-    current_attack.average_in_bytes   = average_speed_element.total.in_bytes;
-    current_attack.average_in_flows   = average_speed_element.in_flows;
-
-    current_attack.average_out_packets = average_speed_element.total.out_packets;
-    current_attack.average_out_bytes   = average_speed_element.total.out_bytes;
-    current_attack.average_out_flows   = average_speed_element.out_flows;
-
     return true;
 }
 
 
 // Speed recalculation function for IPv6 hosts calls it for each host during speed recalculation
-void speed_callback_ipv6(const subnet_ipv6_cidr_mask_t& current_subnet, const subnet_counter_t& current_average_speed_element) {
+void speed_calculation_callback_local_ipv6(const subnet_ipv6_cidr_mask_t& current_subnet, const subnet_counter_t& current_average_speed_element) {
     // We should check thresholds only for per host counters for IPv6 and only when any ban actions for IPv6 traffic were enabled
     if (!global_ban_settings.enable_ban_ipv6) {
         return;
     }
+
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
 
     // We support only global group
     std::string host_group_name = "global";
@@ -1963,7 +1669,7 @@ void speed_callback_ipv6(const subnet_ipv6_cidr_mask_t& current_subnet, const su
         return;
     }
 
-    bool this_ip_is_already_banned = ban_list_ipv6_ng.is_blackholed(current_subnet);
+    bool this_ip_is_already_banned = ban_list_ipv6.is_blackholed(current_subnet);
 
     if (this_ip_is_already_banned) {
         return;
@@ -1977,7 +1683,9 @@ void speed_callback_ipv6(const subnet_ipv6_cidr_mask_t& current_subnet, const su
     std::string parent_group;
 
     attack_details_t attack_details;
-    fill_attack_information(current_average_speed_element, attack_details, host_group_name, parent_group, unban_enabled, global_ban_time);
+    attack_details.traffic_counters = current_average_speed_element;
+    
+    fill_attack_information(attack_details, host_group_name, parent_group, unban_enabled, global_ban_time);
 
     attack_details.ipv6 = true;
     // TODO: Also, we should find IPv6 network for attack here
@@ -2001,11 +1709,160 @@ void speed_callback_subnet_ipv6(subnet_ipv6_cidr_mask_t* subnet, subnet_counter_
     return;
 }
 
+// This function works as callback from main speed calculation thread and decides when we should block host using static thresholds
+void speed_calculation_callback_local_ipv4(const uint32_t& client_ip, const subnet_counter_t& speed_element) {
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+    extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
+    extern patricia_tree_t* whitelist_tree_ipv4;
+    extern patricia_tree_t* lookup_tree_ipv4;
+
+    extern boost::circular_buffer<simple_packet_t> ipv4_packets_circular_buffer;
+
+    // Check global ban settings
+    if (!global_ban_settings.enable_ban) {
+        return;
+    }
+
+    // Lookup network for IP as we need it for hostgorup lookup logic
+    subnet_cidr_mask_t customer_subnet;
+    bool lookup_result =
+        lookup_ip_in_integer_form_inpatricia_and_return_subnet_if_found(lookup_tree_ipv4, client_ip, customer_subnet);
+
+    if (!lookup_result) {
+        // It's not critical, we can ignore it
+        logger << log4cpp::Priority::WARN << "Could not get customer's network for IP " << convert_ip_as_uint_to_string(client_ip);
+    }
+
+    std::string host_group_name;
+    ban_settings_t current_ban_settings = get_ban_settings_for_this_subnet(customer_subnet, host_group_name);
+
+    // Hostgroup has blocks disabled
+    if (!current_ban_settings.enable_ban) {
+        return;
+    }
+
+    attack_details_t attack_details;
+
+    // Static thresholds
+    attack_detection_threshold_type_t attack_detection_source;
+    attack_detection_direction_type_t attack_detection_direction;
+
+    bool should_block = we_should_ban_this_entity(speed_element, current_ban_settings,
+                                                  attack_detection_source, attack_detection_direction);
+
+    if (!should_block) {
+        return;
+    }
+
+    // We should execute check over whitelist
+    // In common case, this check is pretty complicated and we should execute it only for hosts which exceed
+    // threshold
+    bool in_white_list = ip_belongs_to_patricia_tree(whitelist_tree_ipv4, client_ip);
+
+    // And if we found host here disable any actions about blocks
+    if (in_white_list) {
+        return;
+    }
+
+    // If we decided to block this host we should check two cases:
+    // 1) Already banned
+    // 2) We already started packets collection for this IP address
+
+    // They could be filled or not yet filled
+    // TODO: with this check we should REMOVE items from bucket storage when attack handled
+    bool we_already_have_buckets_for_this_ip = packet_buckets_ipv4_storage.we_have_bucket_for_this_ip(client_ip);
+
+    if (we_already_have_buckets_for_this_ip) {
+        return;
+    }
+
+    bool this_ip_is_already_banned = ban_list_ipv4.is_blackholed(client_ip);
+
+    if (this_ip_is_already_banned) {
+        return;
+    }
+
+    std::string ddos_detection_threshold_as_string = get_human_readable_threshold_type(attack_detection_source);
+    std::string ddos_detection_direction = get_human_readable_attack_detection_direction(attack_detection_direction);
+
+    logger << log4cpp::Priority::INFO << "We have detected attack for " << convert_ip_as_uint_to_string(client_ip)
+           << " using " << ddos_detection_threshold_as_string << " threshold "
+           << "in direction " << ddos_detection_direction << " "
+           << "host group: " << host_group_name;
+
+    
+    attack_details.traffic_counters = speed_element;
+
+    // Set threshold direction
+    attack_details.attack_detection_direction = attack_detection_direction;
+
+    // Set threshold type
+    attack_details.attack_detection_threshold = attack_detection_source;
+
+    // Fill attack details. This operation is pretty simple and involves only long prefix match lookup +
+    // field copy
+    std::string parent_group;
+   
+    fill_attack_information(attack_details, host_group_name,
+                            parent_group, unban_enabled,
+                            global_ban_time);
+
+    attack_details.customer_network = customer_subnet;
+
+    bool enable_backet_capture =
+        packet_buckets_ipv4_storage.enable_packet_capture(client_ip, attack_details, collection_pattern_t::ONCE);
+
+    if (!enable_backet_capture) {
+        logger << log4cpp::Priority::ERROR << "Could not enable packet capture for deep analytics for IP "
+               << convert_ip_as_uint_to_string(client_ip);
+        return;
+    }
+
+    logger << log4cpp::Priority::INFO << "Enabled packet capture for IP " << convert_ip_as_uint_to_string(client_ip);
+
+    return;
+}
+
+// Increments in and out flow counters
+// Returns false when we cannot find flow for this IP
+bool increment_flow_counters(subnet_counter_t& new_speed_element, uint32_t client_ip, double speed_calc_period) {
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern std::mutex flow_counter_mutex;
+
+    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+
+    auto current_flow_counter = SubnetVectorMapFlow.find(client_ip);
+
+    if (current_flow_counter == SubnetVectorMapFlow.end()) {
+        // We have no entries for this IP
+        return false;
+    }
+
+    uint64_t total_out_flows =
+        (uint64_t)current_flow_counter->second.out_tcp.size() + (uint64_t)current_flow_counter->second.out_udp.size() +
+        (uint64_t)current_flow_counter->second.out_icmp.size() + (uint64_t)current_flow_counter->second.out_other.size();
+
+    uint64_t total_in_flows =
+        (uint64_t)current_flow_counter->second.in_tcp.size() + (uint64_t)current_flow_counter->second.in_udp.size() +
+        (uint64_t)current_flow_counter->second.in_icmp.size() + (uint64_t)current_flow_counter->second.in_other.size();
+
+    // logger << log4cpp::Priority::DEBUG << "total out flows: " << total_out_flows << " total in flows: " << total_in_flows << " speed calc period: " << speed_calc_period;
+
+    new_speed_element.out_flows = uint64_t((double)total_out_flows / speed_calc_period);
+    new_speed_element.in_flows  = uint64_t((double)total_in_flows / speed_calc_period);
+
+    return true;
+}
+
 
 /* Calculate speed for all connnections */
 void recalculate_speed() {
     // logger<< log4cpp::Priority::INFO<<"We run recalculate_speed";
     double speed_calc_period = recalculate_speed_timeout;
+
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
 
     std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
 
@@ -2047,118 +1904,47 @@ void recalculate_speed() {
         speed_calc_period = time_difference;
     }
 
-    subnet_counter_t zero_map_element{};
-
     uint64_t incoming_total_flows = 0;
     uint64_t outgoing_total_flows = 0;
 
     ipv4_network_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
 
+    uint64_t flow_exists_for_ip         = 0;
+    uint64_t flow_does_not_exist_for_ip = 0;
 
-    for (map_of_vector_counters_t::iterator itr = SubnetVectorMap.begin(); itr != SubnetVectorMap.end(); ++itr) {
-        for (vector_of_counters::iterator vector_itr = itr->second.begin(); vector_itr != itr->second.end(); ++vector_itr) {
-            int current_index = vector_itr - itr->second.begin();
+    ipv4_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv4, [&outgoing_total_flows, &incoming_total_flows, &flow_exists_for_ip,
+     &flow_does_not_exist_for_ip](const uint32_t& ip, subnet_counter_t& new_speed_element, double speed_calc_period) {
+        if (enable_connection_tracking) {
+            bool res = increment_flow_counters(new_speed_element, fast_ntoh(ip), speed_calc_period);
 
-            // New element
-            subnet_counter_t new_speed_element;
-
-            // convert to host order for math operations
-            uint32_t subnet_ip                     = ntohl(itr->first.subnet_address);
-            uint32_t client_ip_in_host_bytes_order = subnet_ip + current_index;
-
-            // covnert to our standard network byte order
-            uint32_t client_ip = htonl(client_ip_in_host_bytes_order);
-
-            // Calculate speed for IP or whole subnet
-            build_speed_counters_from_packet_counters(new_speed_element, *vector_itr, speed_calc_period);
-
-            conntrack_main_struct_t* flow_counter_ptr = &SubnetVectorMapFlow[itr->first][current_index];
-
-            if (enable_connection_tracking) {
-                // todo: optimize this operations!
-                // it's really bad and SLOW CODE
-                uint64_t total_out_flows =
-                    (uint64_t)flow_counter_ptr->out_tcp.size() + (uint64_t)flow_counter_ptr->out_udp.size() +
-                    (uint64_t)flow_counter_ptr->out_icmp.size() + (uint64_t)flow_counter_ptr->out_other.size();
-
-                uint64_t total_in_flows =
-                    (uint64_t)flow_counter_ptr->in_tcp.size() + (uint64_t)flow_counter_ptr->in_udp.size() +
-                    (uint64_t)flow_counter_ptr->in_icmp.size() + (uint64_t)flow_counter_ptr->in_other.size();
-
-                new_speed_element.out_flows = uint64_t((double)total_out_flows / speed_calc_period);
-                new_speed_element.in_flows  = uint64_t((double)total_in_flows / speed_calc_period);
-
+            if (res) {
                 // Increment global counter
                 outgoing_total_flows += new_speed_element.out_flows;
                 incoming_total_flows += new_speed_element.in_flows;
+
+                flow_exists_for_ip++;
+
+                // logger << log4cpp::Priority::DEBUG << convert_ipv4_subnet_to_string(subnet)
+                //    << "in flows: " << new_speed_element.in_flows << " out flows: " <<
+                //    new_speed_element.out_flows;
             } else {
-                new_speed_element.out_flows = 0;
-                new_speed_element.in_flows  = 0;
+                // We did not find record
+                flow_does_not_exist_for_ip++;
             }
-
-            /* Moving average recalculation */
-            // http://en.wikipedia.org/wiki/Moving_average#Application_to_measuring_computer_performance
-            // double speed_calc_period = 1;
-            double exp_power = -speed_calc_period / average_calculation_amount;
-            double exp_value = exp(exp_power);
-
-            subnet_counter_t& current_average_speed_element = SubnetVectorMapSpeedAverage[itr->first][current_index];
-
-            // Calculate average speed from per-second speed
-            build_average_speed_counters_from_speed_counters(current_average_speed_element, new_speed_element, exp_value);
-
-            if (enable_connection_tracking) {
-                current_average_speed_element.out_flows =
-                    uint64_t(new_speed_element.out_flows + exp_value * ((double)current_average_speed_element.out_flows -
-                                                                        (double)new_speed_element.out_flows));
-
-                current_average_speed_element.in_flows =
-                    uint64_t(new_speed_element.in_flows + exp_value * ((double)current_average_speed_element.in_flows -
-                                                                       (double)new_speed_element.in_flows));
-            }
-
-            /* Moving average recalculation end */
-            std::string host_group_name;
-            ban_settings_t current_ban_settings = get_ban_settings_for_this_subnet(itr->first, host_group_name);
-
-            attack_detection_threshold_type_t attack_detection_source;
-            attack_detection_direction_type_t attack_detection_direction;
-
-
-            if (we_should_ban_this_entity(current_average_speed_element, current_ban_settings, attack_detection_source,
-                                          attack_detection_direction)) {
-                logger << log4cpp::Priority::DEBUG << "We have found host group for this host as: " << host_group_name;
-
-                std::string flow_attack_details = "";
-
-                if (enable_connection_tracking) {
-                    flow_attack_details = print_flow_tracking_for_ip(*flow_counter_ptr, convert_ip_as_uint_to_string(client_ip));
-                }
-
-                // TODO: we should pass type of ddos ban source (pps, flowd, bandwidth)!
-                execute_ip_ban(client_ip, current_average_speed_element, flow_attack_details, itr->first);
-            }
-
-            SubnetVectorMapSpeed[itr->first][current_index] = new_speed_element;
-
-            *vector_itr = zero_map_element;
         }
-    }
+    });
 
     // Calculate IPv6 per network traffic
     ipv6_subnet_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, nullptr);
 
     // Recalculate traffic for hosts
-    ipv6_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_callback_ipv6);
-
-
-    // Calculate global flow speed
-    incoming_total_flows_speed = uint64_t((double)incoming_total_flows / (double)speed_calc_period);
-    outgoing_total_flows_speed = uint64_t((double)outgoing_total_flows / (double)speed_calc_period);
+    ipv6_host_counters.recalculate_speed(speed_calc_period, (double)average_calculation_amount, speed_calculation_callback_local_ipv6);
 
     if (enable_connection_tracking) {
-        // Clean Flow Counter
-        std::lock_guard<std::mutex> lock_guard(flow_counter);
+        // Calculate global flow speed
+        incoming_total_flows_speed = uint64_t((double)incoming_total_flows / (double)speed_calc_period);
+        outgoing_total_flows_speed = uint64_t((double)outgoing_total_flows / (double)speed_calc_period);
+
         zeroify_all_flow_counters();
     }
 
@@ -2228,7 +2014,13 @@ void recalculate_speed() {
     double fractional = std::modf(speed_calculation_diff.count(), &integer);
 
     speed_calculation_time.tv_sec  = time_t(integer);
+
+    // timeval field tv_usec has type long on Windows
+#ifdef _WIN32
+    speed_calculation_time.tv_usec = long(fractional * 1000000);
+#else
     speed_calculation_time.tv_usec = suseconds_t(fractional * 1000000);
+#endif
 
     // Report cases when we calculate speed too slow
     if (speed_calculation_time.tv_sec > 0) {
@@ -2240,10 +2032,70 @@ void recalculate_speed() {
     }
 }
 
-std::string draw_table_ipv6(attack_detection_direction_type_t sort_direction, bool do_redis_update, attack_detection_threshold_type_t sorter_type) {
+std::string draw_table_ipv4_hash(attack_detection_direction_type_t sort_direction, attack_detection_threshold_type_t sorter_type) {
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
+    std::stringstream output_buffer;
+
+    unsigned int shift_for_sort = max_ips_in_list;
+
+    // Allocate vector with size which matches number of required elements
+    std::vector<std::pair<uint32_t, subnet_counter_t>> vector_for_sort(shift_for_sort);
+
+    ipv4_host_counters.get_top_k_average_speed(vector_for_sort, sorter_type, sort_direction);
+
+    for (const auto& item: vector_for_sort) {
+        // When we do not have enough hosts in output vector we will keep all entries nil, filter out them
+        if (item.first == 0) {
+            continue;
+        }
+
+        uint32_t client_ip              = item.first;
+        std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip);
+
+        uint64_t pps   = 0;
+        uint64_t bps   = 0;
+        uint64_t flows = 0;
+
+        // Here we could have average or instantaneous speed
+        const subnet_counter_t& current_speed_element = item.second;
+
+        // Create polymorphic pps, byte and flow counters
+        if (sort_direction == attack_detection_direction_type_t::incoming) {
+            pps   = current_speed_element.total.in_packets;
+            bps   = current_speed_element.total.in_bytes;
+            flows = current_speed_element.in_flows;
+        } else if (sort_direction == attack_detection_direction_type_t::outgoing) {
+            pps   = current_speed_element.total.out_packets;
+            bps   = current_speed_element.total.out_bytes;
+            flows = current_speed_element.out_flows;
+        }
+
+        uint64_t mbps = convert_speed_to_mbps(bps);
+
+        // We use setw for alignment
+        output_buffer << client_ip_as_string << "\t\t";
+
+        std::string is_banned = ban_list_ipv4.is_blackholed(client_ip) ? " *banned* " : "";
+
+        output_buffer << std::setw(6) << pps << " pps ";
+        output_buffer << std::setw(6) << mbps << " mbps ";
+        output_buffer << std::setw(6) << flows << " flows ";
+
+        output_buffer << is_banned << std::endl;
+    }
+
+    return output_buffer.str();
+}
+
+
+std::string draw_table_ipv6(attack_detection_direction_type_t sort_direction, attack_detection_threshold_type_t sorter_type) {
     std::vector<pair_of_map_for_ipv6_subnet_counters_elements_t> vector_for_sort;
     ssize_t size_of_ipv6_counters_map = 0;
     std::stringstream output_buffer;
+
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
 
     // TODO: implement method for such tasks
     {
@@ -2322,116 +2174,13 @@ std::string draw_table_ipv6(attack_detection_direction_type_t sort_direction, bo
         // We use setw for alignment
         output_buffer << client_ip_as_string << "\t";
 
-        std::string is_banned = ban_list_ipv6_ng.is_blackholed(ii->first) ? " *banned* " : "";
+        std::string is_banned = ban_list_ipv6.is_blackholed(ii->first) ? " *banned* " : "";
 
         output_buffer << std::setw(6) << pps << " pps ";
         output_buffer << std::setw(6) << mbps << " mbps ";
         output_buffer << std::setw(6) << flows << " flows ";
 
         output_buffer << is_banned << std::endl;
-    }
-
-    return output_buffer.str();
-}
-
-std::string draw_table_ipv4(const attack_detection_direction_type_t& data_direction,
-                            bool do_redis_update,
-                            const attack_detection_threshold_type_t& sorter_type) {
-    std::vector<pair_of_map_elements> vector_for_sort;
-
-    std::stringstream output_buffer;
-
-    // Preallocate memory for sort vector
-    // We use total networks size for this vector
-    vector_for_sort.reserve(total_number_of_hosts_in_our_networks);
-
-    map_of_vector_counters_t* current_speed_map = &SubnetVectorMapSpeedAverage;
-
-    subnet_counter_t zero_map_element{};
-
-    unsigned int count_of_zero_speed_packets = 0;
-    for (map_of_vector_counters_t::iterator itr = current_speed_map->begin(); itr != current_speed_map->end(); ++itr) {
-        for (vector_of_counters::iterator vector_itr = itr->second.begin(); vector_itr != itr->second.end(); ++vector_itr) {
-            int current_index = vector_itr - itr->second.begin();
-
-            // convert to host order for math operations
-            uint32_t subnet_ip                     = ntohl(itr->first.subnet_address);
-            uint32_t client_ip_in_host_bytes_order = subnet_ip + current_index;
-
-            // covnert to our standard network byte order
-            uint32_t client_ip = htonl(client_ip_in_host_bytes_order);
-
-            // Do not add zero speed packets to sort list
-            if (memcmp((void*)&zero_map_element, &*vector_itr, sizeof(subnet_counter_t)) != 0) {
-                vector_for_sort.push_back(std::make_pair(client_ip, *vector_itr));
-            } else {
-                count_of_zero_speed_packets++;
-            }
-        }
-    }
-
-    // Sort only first X elements in this vector
-    unsigned int shift_for_sort = max_ips_in_list;
-
-    if (data_direction == attack_detection_direction_type_t::incoming or data_direction == attack_detection_direction_type_t::outgoing) {
-        // Because in another case we will got segmentation fault
-        unsigned int vector_size = vector_for_sort.size();
-
-        if (vector_size < shift_for_sort) {
-            shift_for_sort = vector_size;
-        }
-
-        std::partial_sort(vector_for_sort.begin(), vector_for_sort.begin() + shift_for_sort, vector_for_sort.end(),
-                          TrafficComparatorClass<pair_of_map_elements>(data_direction, sorter_type));
-    } else {
-        logger << log4cpp::Priority::ERROR << "Unexpected bahaviour on sort function";
-        return "Internal error";
-    }
-
-    unsigned int element_number = 0;
-
-    // In this loop we print only top X talkers in our subnet to screen buffer
-    for (std::vector<pair_of_map_elements>::iterator ii = vector_for_sort.begin(); ii != vector_for_sort.end(); ++ii) {
-        // Print first max_ips_in_list elements in list, we will show top X "huge" channel loaders
-        if (element_number >= max_ips_in_list) {
-            break;
-        }
-
-        uint32_t client_ip              = (*ii).first;
-        std::string client_ip_as_string = convert_ip_as_uint_to_string((*ii).first);
-
-        uint64_t pps   = 0;
-        uint64_t bps   = 0;
-        uint64_t flows = 0;
-
-        // Here we could have average or instantaneous speed
-        subnet_counter_t* current_speed_element = &ii->second;
-
-        // Create polymorphic pps, byte and flow counters
-        if (data_direction == attack_detection_direction_type_t::incoming) {
-            pps   = current_speed_element->total.in_packets;
-            bps   = current_speed_element->total.in_bytes;
-            flows = current_speed_element->in_flows;
-        } else if (data_direction == attack_detection_direction_type_t::outgoing) {
-            pps   = current_speed_element->total.out_packets;
-            bps   = current_speed_element->total.out_bytes;
-            flows = current_speed_element->out_flows;
-        }
-
-        uint64_t mbps = convert_speed_to_mbps(bps);
-
-        std::string is_banned = ban_list.count(client_ip) > 0 ? " *banned* " : "";
-
-        // We use setw for alignment
-        output_buffer << client_ip_as_string << "\t\t";
-
-        output_buffer << std::setw(6) << pps << " pps ";
-        output_buffer << std::setw(6) << mbps << " mbps ";
-        output_buffer << std::setw(6) << flows << " flows ";
-
-        output_buffer << is_banned << std::endl;
-
-        element_number++;
     }
 
     return output_buffer.str();
@@ -2453,27 +2202,14 @@ void print_screen_contents_into_file(std::string screen_data_stats_param, std::s
 }
 
 void zeroify_all_flow_counters() {
-    // On creating it initilizes by zeros
-    conntrack_main_struct_t zero_conntrack_main_struct;
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern std::mutex flow_counter_mutex;
 
-    // Iterate over map
-    for (map_of_vector_counters_for_flow_t::iterator itr = SubnetVectorMapFlow.begin(); itr != SubnetVectorMapFlow.end(); ++itr) {
-        // Iterate over vector
-        for (vector_of_flow_counters_t::iterator vector_iterator = itr->second.begin();
-             vector_iterator != itr->second.end(); ++vector_iterator) {
-            // TODO: rewrite this monkey code
-            vector_iterator->in_tcp.clear();
-            vector_iterator->in_udp.clear();
-            vector_iterator->in_icmp.clear();
-            vector_iterator->in_other.clear();
+    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
 
-            vector_iterator->out_tcp.clear();
-            vector_iterator->out_udp.clear();
-            vector_iterator->out_icmp.clear();
-            vector_iterator->out_other.clear();
-        }
-    }
+    SubnetVectorMapFlow.clear();
 }
+
 
 #ifdef KAFKA
 // Exports traffic to Kafka
@@ -2533,12 +2269,35 @@ void export_to_kafka(const simple_packet_t& current_packet) {
 }
 #endif
 
+// Adds traffic to buckets from hot path
+template <typename T>
+void collect_traffic_to_buckets_ipv6(const simple_packet_t& current_packet, packet_buckets_storage_t<T>& packet_buckets_storage) {
+    // Yes, it's not very optimal to construct subnet_ipv6_cidr_mask_t again but it offers way clearer logic
+    // In future we should get rid of subnet_ipv6_cidr_mask_t and use subnet_address directly
+    //
+    if (current_packet.packet_direction == OUTGOING) {
+        subnet_ipv6_cidr_mask_t ipv6_address;
+        ipv6_address.set_cidr_prefix_length(128);
+        ipv6_address.set_subnet_address(&current_packet.src_ipv6);
+
+        packet_buckets_storage.add_packet_to_storage(ipv6_address, current_packet);
+    } else if (current_packet.packet_direction == INCOMING) {
+        subnet_ipv6_cidr_mask_t ipv6_address;
+        ipv6_address.set_cidr_prefix_length(128);
+        ipv6_address.set_subnet_address(&current_packet.dst_ipv6);
+
+        packet_buckets_storage.add_packet_to_storage(ipv6_address, current_packet);
+    }
+}
+
 // Process IPv6 traffic
 void process_ipv6_packet(simple_packet_t& current_packet) {
-    extern bool kafka_traffic_export;
-
     uint64_t sampled_number_of_packets = current_packet.number_of_packets * current_packet.sample_ratio;
     uint64_t sampled_number_of_bytes   = current_packet.length * current_packet.sample_ratio;
+
+#ifdef KAFKA
+    extern bool kafka_traffic_export;
+#endif
 
     subnet_ipv6_cidr_mask_t ipv6_cidr_subnet;
 
@@ -2550,6 +2309,12 @@ void process_ipv6_packet(simple_packet_t& current_packet) {
         export_to_kafka(current_packet);
     }
 #endif
+
+    // Skip processing of specific traffic direction
+    if ((current_packet.packet_direction == INCOMING && !process_incoming_traffic) or
+        (current_packet.packet_direction == OUTGOING && !process_outgoing_traffic)) {
+        return;
+    }
 
 #ifdef USE_NEW_ATOMIC_BUILTINS
     __atomic_add_fetch(&total_counters_ipv6.total_counters[current_packet.packet_direction].packets,
@@ -2583,37 +2348,52 @@ void process_ipv6_packet(simple_packet_t& current_packet) {
     // Here I use counters allocated per /128. In some future we could offer option to count them in diffenrent way
     // (/64, /96)
     {
-        std::lock_guard<std::mutex> lock_guard(ipv6_host_counters.counter_map_mutex);
-
         if (current_packet.packet_direction == OUTGOING) {
             subnet_ipv6_cidr_mask_t ipv6_address;
             ipv6_address.set_cidr_prefix_length(128);
             ipv6_address.set_subnet_address(&current_packet.src_ipv6);
 
-            subnet_counter_t& counter_ptr = ipv6_host_counters.counter_map[ipv6_address];
-            increment_outgoing_counters(counter_ptr, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-
-            // Collect packets for DDoS analytics engine
-            packet_buckets_ipv6_storage.add_packet_to_storage(ipv6_address, current_packet);
+            ipv6_host_counters.increment_outgoing_counters_for_key(ipv6_address, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
         } else if (current_packet.packet_direction == INCOMING) {
             subnet_ipv6_cidr_mask_t ipv6_address;
             ipv6_address.set_cidr_prefix_length(128);
             ipv6_address.set_subnet_address(&current_packet.dst_ipv6);
 
-            subnet_counter_t& counter_ptr = ipv6_host_counters.counter_map[ipv6_address];
-            increment_incoming_counters(counter_ptr, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-
-            // Collect packets for DDoS analytics engine
-            packet_buckets_ipv6_storage.add_packet_to_storage(ipv6_address, current_packet);
+            ipv6_host_counters.increment_incoming_counters_for_key(ipv6_address, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
         }
+
+        // Collect packets for DDoS analytics engine
+        collect_traffic_to_buckets_ipv6(current_packet, packet_buckets_ipv6_storage);
     }
 
     return;
 }
 
+// Adds traffic to buckets from hot path
+template <typename T>
+void collect_traffic_to_buckets_ipv4(const simple_packet_t& current_packet, packet_buckets_storage_t<T>& packet_buckets_storage) {
+    if (current_packet.packet_direction == OUTGOING) {
+        // With this code we will add parsed packets and their raw versions (if we have they) to circular buffer to
+        // we are interested about they
+        packet_buckets_storage.add_packet_to_storage(current_packet.src_ip, current_packet);
+    } else if (current_packet.packet_direction == INCOMING) {
+        // With this code we will add parsed packets and their raw versions (if we have they) to circular buffer to
+        // we are interested about they
+        packet_buckets_storage.add_packet_to_storage(current_packet.dst_ip, current_packet);
+    }
+}
+
+
 // Process simple unified packet
 void process_packet(simple_packet_t& current_packet) {
+    extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
+    extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
+
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+
+#ifdef KAFKA
     extern bool kafka_traffic_export;
+#endif
 
     // Packets dump is very useful for bug hunting
     if (DEBUG_DUMP_ALL_PACKETS) {
@@ -2682,12 +2462,6 @@ void process_packet(simple_packet_t& current_packet) {
         return;
     }
 
-    uint32_t subnet_in_host_byte_order = 0;
-    // We operate in host bytes order and need to convert subnet
-    if (!current_subnet.is_zero_subnet()) {
-        subnet_in_host_byte_order = ntohl(current_subnet.subnet_address);
-    }
-
     if (current_packet.packet_direction == OUTGOING or current_packet.packet_direction == INCOMING) {
         std::lock_guard<std::mutex> lock_guard(ipv4_network_counters.counter_map_mutex);
 
@@ -2698,19 +2472,6 @@ void process_packet(simple_packet_t& current_packet) {
             increment_outgoing_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
         } else if (current_packet.packet_direction == INCOMING) {
             increment_incoming_counters(counters, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-        }
-    }
-
-    map_of_vector_counters_for_flow_t::iterator itr_flow;
-
-    if (enable_connection_tracking) {
-        if (current_packet.packet_direction == OUTGOING or current_packet.packet_direction == INCOMING) {
-            itr_flow = SubnetVectorMapFlow.find(current_subnet);
-
-            if (itr_flow == SubnetVectorMapFlow.end()) {
-                logger << log4cpp::Priority::ERROR << "Can't find vector address in subnet flow map";
-                return;
-            }
         }
     }
 
@@ -2731,106 +2492,30 @@ void process_packet(simple_packet_t& current_packet) {
     __sync_fetch_and_add(&total_counters_ipv4.total_counters[current_packet.packet_direction].bytes, sampled_number_of_bytes);
 #endif
 
-    // Try to find map key for this subnet
-    map_of_vector_counters_t::iterator itr;
+    // Add traffic to buckets when we have them
+    collect_traffic_to_buckets_ipv4(current_packet, packet_buckets_ipv4_storage);
 
-    if (current_packet.packet_direction == OUTGOING or current_packet.packet_direction == INCOMING) {
-        // Find element in map of vectors
-        itr = SubnetVectorMap.find(current_subnet);
-
-        if (itr == SubnetVectorMap.end()) {
-            logger << log4cpp::Priority::ERROR << "Can't find vector address in subnet map";
-            return;
-        }
+    // Increment counters for all local hosts using new counters
+    if (current_packet.packet_direction == OUTGOING) {
+        ipv4_host_counters.increment_outgoing_counters_for_key(current_packet.src_ip, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+    } else if (current_packet.packet_direction == INCOMING) {
+        ipv4_host_counters.increment_incoming_counters_for_key(current_packet.dst_ip, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
+    } else {
+        // No reasons to keep locks for other or internal
     }
 
-
-    // Incerement main and per protocol packet counters
+    // Increment main and per protocol packet counters
     if (current_packet.packet_direction == OUTGOING) {
-        int64_t shift_in_vector = (int64_t)ntohl(current_packet.src_ip) - (int64_t)subnet_in_host_byte_order;
-
-        if (shift_in_vector < 0 or shift_in_vector >= itr->second.size()) {
-            logger << log4cpp::Priority::ERROR << "We tried to access to element with index " << shift_in_vector
-                   << " which located outside allocated vector with size " << itr->second.size();
-
-            logger << log4cpp::Priority::ERROR
-                   << "We expect issues with this packet in OUTGOING direction: " << print_simple_packet(current_packet);
-
-            return;
-        }
-
-        subnet_counter_t& current_element = itr->second[shift_in_vector];
-
-        increment_outgoing_counters(current_element, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-
         if (enable_connection_tracking) {
-            increment_outgoing_flow_counters(SubnetVectorMapFlow, shift_in_vector, current_packet,
-                                             sampled_number_of_packets, sampled_number_of_bytes, current_subnet);
+            increment_outgoing_flow_counters(fast_ntoh(current_packet.src_ip), current_packet,
+                                             sampled_number_of_packets, sampled_number_of_bytes);
         }
     } else if (current_packet.packet_direction == INCOMING) {
-        int64_t shift_in_vector = (int64_t)ntohl(current_packet.dst_ip) - (int64_t)subnet_in_host_byte_order;
-
-        if (shift_in_vector < 0 or shift_in_vector >= itr->second.size()) {
-            logger << log4cpp::Priority::ERROR << "We tried to access to element with index " << shift_in_vector
-                   << " which located outside allocated vector with size " << itr->second.size();
-
-            logger << log4cpp::Priority::ERROR
-                   << "We expect issues with this packet in INCOMING direction: " << print_simple_packet(current_packet);
-
-            return;
-        }
-
-        subnet_counter_t& current_element = itr->second[shift_in_vector];
-
-        increment_incoming_counters(current_element, current_packet, sampled_number_of_packets, sampled_number_of_bytes);
-
         if (enable_connection_tracking) {
-            increment_incoming_flow_counters(SubnetVectorMapFlow, shift_in_vector, current_packet,
-                                             sampled_number_of_packets, sampled_number_of_bytes, current_subnet);
+            increment_incoming_flow_counters(fast_ntoh(current_packet.dst_ip), current_packet,
+                                 sampled_number_of_packets, sampled_number_of_bytes);
         }
     } else if (current_packet.packet_direction == INTERNAL) {
-    }
-
-    // Exceute ban related processing
-    if (current_packet.packet_direction == OUTGOING) {
-        // Collect data when ban client
-        if (ban_details_records_count != 0 && !ban_list_details.empty() && ban_list_details.count(current_packet.src_ip) > 0 &&
-            ban_list_details[current_packet.src_ip].size() < ban_details_records_count) {
-
-            std::lock_guard<std::mutex> lock_guard(ban_list_details_mutex);
-
-            if (collect_attack_pcap_dumps) {
-                // this code SHOULD NOT be called without mutex!
-                if (current_packet.packet_payload_length > 0 && current_packet.packet_payload_pointer != NULL) {
-                    ban_list[current_packet.src_ip].pcap_attack_dump.write_packet(current_packet.packet_payload_pointer,
-                                                                                  current_packet.packet_payload_length,
-                                                                                  current_packet.packet_payload_length);
-                }
-            }
-
-            ban_list_details[current_packet.src_ip].push_back(current_packet);
-        }
-    }
-
-
-    if (current_packet.packet_direction == INCOMING) {
-        // Collect attack details
-        if (ban_details_records_count != 0 && !ban_list_details.empty() && ban_list_details.count(current_packet.dst_ip) > 0 &&
-            ban_list_details[current_packet.dst_ip].size() < ban_details_records_count) {
-
-            std::lock_guard<std::mutex> lock_guard(ban_list_details_mutex);
-
-            if (collect_attack_pcap_dumps) {
-                // this code SHOULD NOT be called without mutex!
-                if (current_packet.packet_payload_length > 0 && current_packet.packet_payload_pointer != NULL) {
-                    ban_list[current_packet.dst_ip].pcap_attack_dump.write_packet(current_packet.packet_payload_pointer,
-                                                                                  current_packet.packet_payload_length,
-                                                                                  current_packet.packet_payload_length);
-                }
-            }
-
-            ban_list_details[current_packet.dst_ip].push_back(current_packet);
-        }
     }
 }
 
@@ -2866,84 +2551,97 @@ void inaccurate_time_generator() {
     }
 }
 
-
-void increment_incoming_flow_counters(map_of_vector_counters_for_flow_t& SubnetVectorMapFlow,
-                                      int64_t shift_in_vector,
-                                      simple_packet_t& current_packet,
-                                      uint64_t sampled_number_of_packets,
-                                      uint64_t sampled_number_of_bytes,
-                                      const subnet_cidr_mask_t& current_subnet) {
-
-    map_of_vector_counters_for_flow_t::iterator itr_flow = SubnetVectorMapFlow.find(current_subnet);
-
-    if (itr_flow == SubnetVectorMapFlow.end()) {
-        logger << log4cpp::Priority::ERROR << "Can't find vector address in subnet flow map";
-        return;
-    }
-
-    conntrack_main_struct_t* current_element_flow = &itr_flow->second[shift_in_vector];
-
-    packed_conntrack_hash_t flow_tracking_structure;
+// Creates compressed flow tracking structure
+void init_incoming_flow_counting_structure(packed_conntrack_hash_t& flow_tracking_structure, const simple_packet_t& current_packet) {
     flow_tracking_structure.opposite_ip = current_packet.src_ip;
     flow_tracking_structure.src_port    = current_packet.source_port;
     flow_tracking_structure.dst_port    = current_packet.destination_port;
+}
+
+// client_ip is expected in host byte order
+// client_ip in host byte order!
+void increment_incoming_flow_counters(uint32_t client_ip,
+                                      const simple_packet_t& current_packet,
+                                      uint64_t sampled_number_of_packets,
+                                      uint64_t sampled_number_of_bytes) {
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern std::mutex flow_counter_mutex;
+
+    packed_conntrack_hash_t flow_tracking_structure;
+    init_incoming_flow_counting_structure(flow_tracking_structure, current_packet);
 
     // convert this struct to 64 bit integer
-    uint64_t connection_tracking_hash = convert_conntrack_hash_struct_to_integer(&flow_tracking_structure);
+    uint64_t connection_tracking_hash = convert_conntrack_hash_struct_to_integer(flow_tracking_structure);
 
-    if (current_packet.protocol == IPPROTO_TCP) {
-        std::lock_guard<std::mutex> lock_guard(flow_counter);
-        conntrack_key_struct_t* conntrack_key_struct_ptr = &current_element_flow->in_tcp[connection_tracking_hash];
 
-        conntrack_key_struct_ptr->packets += sampled_number_of_packets;
-        conntrack_key_struct_ptr->bytes += sampled_number_of_bytes;
-    } else if (current_packet.protocol == IPPROTO_UDP) {
-        std::lock_guard<std::mutex> lock_guard(flow_counter);
-        conntrack_key_struct_t* conntrack_key_struct_ptr = &current_element_flow->in_udp[connection_tracking_hash];
+    // logger << log4cpp::Priority::ERROR << "incoming flow: " << convert_ip_as_uint_to_string(client_ip)
+    //    << " packets " << sampled_number_of_packets << " bytes " << sampled_number_of_bytes << " hash " << connection_tracking_hash;
 
-        conntrack_key_struct_ptr->packets += sampled_number_of_packets;
-        conntrack_key_struct_ptr->bytes += sampled_number_of_bytes;
+    {
+        std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow[client_ip];
+
+        if (current_packet.protocol == IPPROTO_TCP) {
+            conntrack_key_struct_t& conntrack_key_struct = current_element_flow.in_tcp[connection_tracking_hash];
+
+            conntrack_key_struct.packets += sampled_number_of_packets;
+            conntrack_key_struct.bytes += sampled_number_of_bytes;
+        } else if (current_packet.protocol == IPPROTO_UDP) {
+            conntrack_key_struct_t& conntrack_key_struct = current_element_flow.in_udp[connection_tracking_hash];
+
+            conntrack_key_struct.packets += sampled_number_of_packets;
+            conntrack_key_struct.bytes += sampled_number_of_bytes;
+        }
     }
 }
 
-// Increment all flow counters using specified packet
-void increment_outgoing_flow_counters(map_of_vector_counters_for_flow_t& SubnetVectorMapFlow,
-                                      int64_t shift_in_vector,
-                                      simple_packet_t& current_packet,
-                                      uint64_t sampled_number_of_packets,
-                                      uint64_t sampled_number_of_bytes,
-                                      const subnet_cidr_mask_t& current_subnet) {
-    map_of_vector_counters_for_flow_t::iterator itr_flow = SubnetVectorMapFlow.find(current_subnet);
 
-    if (itr_flow == SubnetVectorMapFlow.end()) {
-        logger << log4cpp::Priority::ERROR << "Can't find vector address in subnet flow map";
-        return;
-    }
-
-    conntrack_main_struct_t* current_element_flow = &itr_flow->second[shift_in_vector];
-
-    packed_conntrack_hash_t flow_tracking_structure;
+// Creates compressed flow tracking structure
+void init_outgoing_flow_counting_structure(packed_conntrack_hash_t& flow_tracking_structure, const simple_packet_t& current_packet) {
     flow_tracking_structure.opposite_ip = current_packet.dst_ip;
     flow_tracking_structure.src_port    = current_packet.source_port;
     flow_tracking_structure.dst_port    = current_packet.destination_port;
+}
+
+// Increment all flow counters using specified packet
+// increment_outgoing_flow_counters
+// client_ip in host byte order!
+void increment_outgoing_flow_counters(uint32_t client_ip,
+                                      const simple_packet_t& current_packet,
+                                      uint64_t sampled_number_of_packets,
+                                      uint64_t sampled_number_of_bytes) {
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+    extern std::mutex flow_counter_mutex;
+
+    packed_conntrack_hash_t flow_tracking_structure;
+    init_outgoing_flow_counting_structure(flow_tracking_structure, current_packet);
 
     // convert this struct to 64 bit integer
-    uint64_t connection_tracking_hash = convert_conntrack_hash_struct_to_integer(&flow_tracking_structure);
+    uint64_t connection_tracking_hash = convert_conntrack_hash_struct_to_integer(flow_tracking_structure);
 
-    if (current_packet.protocol == IPPROTO_TCP) {
-        std::lock_guard<std::mutex> lock_guard(flow_counter);
-        conntrack_key_struct_t* conntrack_key_struct_ptr = &current_element_flow->out_tcp[connection_tracking_hash];
 
-        conntrack_key_struct_ptr->packets += sampled_number_of_packets;
-        conntrack_key_struct_ptr->bytes += sampled_number_of_bytes;
-    } else if (current_packet.protocol == IPPROTO_UDP) {
-        std::lock_guard<std::mutex> lock_guard(flow_counter);
-        conntrack_key_struct_t* conntrack_key_struct_ptr = &current_element_flow->out_udp[connection_tracking_hash];
+    // logger << log4cpp::Priority::ERROR << "outgoing flow: " << convert_ip_as_uint_to_string(client_ip)
+    //    << " packets " << sampled_number_of_packets << " bytes " << sampled_number_of_bytes << " hash " << connection_tracking_hash;
 
-        conntrack_key_struct_ptr->packets += sampled_number_of_packets;
-        conntrack_key_struct_ptr->bytes += sampled_number_of_bytes;
+    {
+        std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+
+        conntrack_main_struct_t& current_element_flow = SubnetVectorMapFlow[client_ip];
+
+        if (current_packet.protocol == IPPROTO_TCP) {
+            conntrack_key_struct_t& conntrack_key_struct = current_element_flow.out_tcp[connection_tracking_hash];
+
+            conntrack_key_struct.packets += sampled_number_of_packets;
+            conntrack_key_struct.bytes += sampled_number_of_bytes;
+        } else if (current_packet.protocol == IPPROTO_UDP) {
+            conntrack_key_struct_t& conntrack_key_struct = current_element_flow.out_udp[connection_tracking_hash];
+
+            conntrack_key_struct.packets += sampled_number_of_packets;
+            conntrack_key_struct.bytes += sampled_number_of_bytes;
+        }
     }
 }
+
 
 // pretty print channel speed in pps and MBit
 std::string print_channel_speed_ipv6(std::string traffic_type, direction_t packet_direction) {
@@ -2974,8 +2672,8 @@ std::string print_channel_speed_ipv6(std::string traffic_type, direction_t packe
 }
 
 template <typename TemplateKeyType>
-void remove_orphaned_buckets(packet_buckets_storage_t<TemplateKeyType>* packet_storage, std::string protocol) {
-    std::lock_guard<std::mutex> lock_guard(packet_storage->packet_buckets_map_mutex);
+void remove_orphaned_buckets(packet_buckets_storage_t<TemplateKeyType>& packet_storage, std::string protocol) {
+    std::lock_guard<std::mutex> lock_guard(packet_storage.packet_buckets_map_mutex);
 
     // List of buckets to remove
     std::vector<TemplateKeyType> buckets_to_remove;
@@ -2984,7 +2682,7 @@ void remove_orphaned_buckets(packet_buckets_storage_t<TemplateKeyType>* packet_s
 
     // Find buckets for removal
     // We should not remove them here because it's tricky to do properly in C++
-    for (auto it = packet_storage->packet_buckets_map.begin(); it != packet_storage->packet_buckets_map.end(); ++it) {
+    for (auto it = packet_storage.packet_buckets_map.begin(); it != packet_storage.packet_buckets_map.end(); ++it) {
         if (should_remove_orphaned_bucket<TemplateKeyType>(*it)) {
             logger << log4cpp::Priority::DEBUG << "We decided to remove " << protocol << " bucket "
                    << convert_any_ip_to_string(it->first);
@@ -2997,47 +2695,143 @@ void remove_orphaned_buckets(packet_buckets_storage_t<TemplateKeyType>* packet_s
 
     for (auto client_ip : buckets_to_remove) {
         // Let's dump some data from it
-        packet_bucket_t* bucket = &packet_storage->packet_buckets_map[client_ip];
+        packet_bucket_t& bucket = packet_storage.packet_buckets_map[client_ip];
 
         logger << log4cpp::Priority::WARN << "We've found orphaned bucket for IP: " << convert_any_ip_to_string(client_ip)
-               << " it has " << bucket->parsed_packets_circular_buffer.size() << " parsed packets"
-               << " and " << bucket->raw_packets_circular_buffer.size() << " raw packets"
+               << " it has " << bucket.parsed_packets_circular_buffer.size() << " parsed packets"
+               << " and " << bucket.raw_packets_circular_buffer.size() << " raw packets"
                << " we will remove it";
 
         // Stop packet collection ASAP
-        bucket->we_could_receive_new_data = false;
+        bucket.we_could_receive_new_data = false;
 
         // Remove it completely from map
-        packet_storage->packet_buckets_map.erase(client_ip);
+        packet_storage.packet_buckets_map.erase(client_ip);
     }
 
     return;
 }
 
-std::string get_attack_description_ipv6(subnet_ipv6_cidr_mask_t ipv6_address, attack_details_t& current_attack) {
+std::string get_attack_description_ipv6(subnet_ipv6_cidr_mask_t ipv6_address, const attack_details_t& current_attack) {
     std::stringstream attack_description;
 
     attack_description << "IP: " << print_ipv6_address(ipv6_address.subnet_address) << "\n";
     attack_description << serialize_attack_description(current_attack) << "\n";
 
-    attack_description << serialize_statistic_counters_about_attack(current_attack);
-
     return attack_description.str();
 }
 
 void execute_ipv6_ban(subnet_ipv6_cidr_mask_t ipv6_client,
-                      attack_details_t current_attack,
-                      std::string simple_packets_dump,
-                      boost::circular_buffer<simple_packet_t>& simple_packets_buffer) {
+                      const attack_details_t& current_attack,
+                      const boost::circular_buffer<simple_packet_t>& simple_packets_buffer,
+                      const boost::circular_buffer<fixed_size_packet_storage_t>& raw_packets_buffer) {
+    extern blackhole_ban_list_t<subnet_ipv6_cidr_mask_t> ban_list_ipv6;
+
     // Execute ban actions
-    ban_list_ipv6_ng.add_to_blackhole(ipv6_client, current_attack);
+    ban_list_ipv6.add_to_blackhole(ipv6_client, current_attack);
 
     logger << log4cpp::Priority::INFO << "IPv6 address " << print_ipv6_cidr_subnet(ipv6_client) << " was banned";
 
     uint32_t zero_ipv4_address = 0;
-    call_ban_handlers(zero_ipv4_address, ipv6_client, true, current_attack, "", attack_detection_source_t::Automatic,
-                      simple_packets_dump, simple_packets_buffer);
+    call_blackhole_actions_per_host(attack_action_t::ban, zero_ipv4_address, ipv6_client, true, current_attack, attack_detection_source_t::Automatic, "", simple_packets_buffer, raw_packets_buffer);
 }
+
+void execute_ipv4_ban(uint32_t client_ip,
+                    const attack_details_t& current_attack,
+                    const std::string& flow_attack_details,
+                    const boost::circular_buffer<simple_packet_t>& simple_packets_buffer,
+                    const boost::circular_buffer<fixed_size_packet_storage_t>& raw_packets_buffer) {
+    extern blackhole_ban_list_t<uint32_t> ban_list_ipv4;
+
+    // Execute ban actions
+    ban_list_ipv4.add_to_blackhole(client_ip, current_attack);
+
+    subnet_ipv6_cidr_mask_t zero_ipv6_address;
+
+    call_blackhole_actions_per_host(attack_action_t::ban, client_ip, zero_ipv6_address, false, current_attack,
+                                    attack_detection_source_t::Automatic, flow_attack_details, simple_packets_buffer,
+                                    raw_packets_buffer);
+}
+
+
+// With this function we could get any element from our flow counter structure
+bool get_element_from_map_of_flow_counters(map_of_vector_counters_for_flow_t& map_of_counters,
+                                           uint32_t client_ip,
+                                           conntrack_main_struct_t& current_conntrack_structure) {
+    extern std::mutex flow_counter_mutex;
+
+    std::lock_guard<std::mutex> lock_guard(flow_counter_mutex);
+    current_conntrack_structure = map_of_counters[client_ip];
+
+    return true;
+}
+
+void process_filled_buckets_ipv4() {
+    extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
+    extern map_of_vector_counters_for_flow_t SubnetVectorMapFlow;
+
+    std::vector<uint32_t> filled_buckets;
+
+    // TODO: amount of processing we do under lock is absolutely insane
+    // We need to rework it
+    std::lock_guard<std::mutex> lock_guard(packet_buckets_ipv4_storage.packet_buckets_map_mutex);
+
+    for (auto itr = packet_buckets_ipv4_storage.packet_buckets_map.begin();
+         itr != packet_buckets_ipv4_storage.packet_buckets_map.end(); ++itr) {
+        // Find one time capture requests which filled completely
+        if (itr->second.collection_pattern == collection_pattern_t::ONCE &&
+            itr->second.we_collected_full_buffer_least_once && !itr->second.is_already_processed) {
+
+            logger << log4cpp::Priority::DEBUG << "Found filled bucket for IPv4 " << convert_any_ip_to_string(itr->first);
+
+            filled_buckets.push_back(itr->first);
+        }
+    }
+
+    // logger << log4cpp::Priority::DEBUG << "We have " << filled_buckets.size() << " filled buckets to process";
+
+    for (auto client_ip_as_integer : filled_buckets) {
+        std::string client_ip_as_string = convert_ip_as_uint_to_string(client_ip_as_integer);
+
+        packet_bucket_t& bucket = packet_buckets_ipv4_storage.packet_buckets_map[client_ip_as_integer];
+
+        // We found something, let's do processing
+        logger << log4cpp::Priority::INFO << "We've got new completely filled bucket with packets for IP " << client_ip_as_string;
+
+        std::string flow_attack_details = "";
+        
+        if (enable_connection_tracking) {
+            conntrack_main_struct_t current_conntrack_main_struct;
+
+            bool get_flow_result = get_element_from_map_of_flow_counters(SubnetVectorMapFlow, fast_ntoh(client_ip_as_integer),
+                                                                         current_conntrack_main_struct);
+
+            if (get_flow_result) {
+                flow_attack_details = print_flow_tracking_for_ip(current_conntrack_main_struct, client_ip_as_string);
+            } else {
+                logger << log4cpp::Priority::WARN << "Could not get flow structure address";
+            }
+        }
+
+       // Here I extract attack details saved at time when we crossed threshold
+        attack_details_t current_attack = bucket.attack_details;
+        
+        // If we have no flow spec just do blackhole
+        execute_ipv4_ban(client_ip_as_integer, current_attack, flow_attack_details,
+                           bucket.parsed_packets_circular_buffer, bucket.raw_packets_circular_buffer);
+
+
+        // Mark it as processed. This will hide it from second call of same function
+        bucket.is_already_processed = true;
+
+        // Stop packet collection ASAP
+        bucket.we_could_receive_new_data = false;
+
+        // Remove it completely from map
+        packet_buckets_ipv4_storage.packet_buckets_map.erase(client_ip_as_integer);
+    }
+}
+
 
 void process_filled_buckets_ipv6() {
     std::lock_guard<std::mutex> lock_guard(packet_buckets_ipv6_storage.packet_buckets_map_mutex);
@@ -3069,21 +2863,8 @@ void process_filled_buckets_ipv6() {
 
         std::string basic_attack_information = get_attack_description_ipv6(ipv6_address, current_attack);
 
-        // For all attack types at this moment we could prepare simple packet dump
-        std::string simple_packet_dump;
-
-        if (bucket->parsed_packets_circular_buffer.size() != 0) {
-            std::stringstream ss;
-
-            for (simple_packet_t& packet : bucket->parsed_packets_circular_buffer) {
-                ss << print_simple_packet(packet);
-            }
-
-            simple_packet_dump = ss.str();
-        }
-
-        // For IPv6 we support only blackhole at this moment. BGP Flow spec for IPv6 isn't so populare and we will skip implementation for some future
-        execute_ipv6_ban(ipv6_address, current_attack, simple_packet_dump, bucket->parsed_packets_circular_buffer);
+        // For IPv6 we support only blackhole at this moment. BGP Flow spec for IPv6 isn't so popular and we will skip implementation for some future
+        execute_ipv6_ban(ipv6_address, current_attack, bucket->parsed_packets_circular_buffer, bucket->raw_packets_circular_buffer);
 
         // Mark it as processed. This will hide it from second call of same function
         bucket->is_already_processed = true;
@@ -3099,9 +2880,15 @@ void process_filled_buckets_ipv6() {
 
 // This functions will check for packet buckets availible for processing
 void check_traffic_buckets() {
+    extern packet_buckets_storage_t<uint32_t> packet_buckets_ipv4_storage;
+
     while (true) {
+        remove_orphaned_buckets(packet_buckets_ipv4_storage, "ipv4");
+
         // Process buckets which haven't filled by packets
-        remove_orphaned_buckets(&packet_buckets_ipv6_storage, "ipv6");
+        remove_orphaned_buckets(packet_buckets_ipv6_storage, "ipv6");
+
+        process_filled_buckets_ipv4();
 
         process_filled_buckets_ipv6();
 
@@ -3183,11 +2970,24 @@ bool get_statistics(std::vector<system_counter_t>& system_counters) {
     system_counters.push_back(system_counter_t("influxdb_writes_failed", influxdb_writes_failed, metric_type_t::counter,
                                                influxdb_writes_failed_desc));
 
+    if (enable_sflow_collection) {
+        auto sflow_stats = get_sflow_stats();
+        system_counters.insert(system_counters.end(), sflow_stats.begin(), sflow_stats.end());
+    }
+
     if (enable_netflow_collection) {
         auto netflow_stats = get_netflow_stats();
 
         system_counters.insert(system_counters.end(), netflow_stats.begin(), netflow_stats.end());
     }
+
+#ifdef FASTNETMON_ENABLE_AFPACKET
+    if (enable_afpacket_collection) {
+        auto af_packet_counters = get_af_packet_stats();
+
+        system_counters.insert(system_counters.end(), af_packet_counters.begin(), af_packet_counters.end());
+    }
+#endif
 
     return true;
 }
@@ -3215,10 +3015,27 @@ std::vector<std::string> generate_list_of_enabled_capture_engines() {
     return list;
 }
 
+// Reads instance_id from filesystem
+bool get_instance_id(std::string& instance_id) {
+    std::string instance_id_path = "/var/lib/instance_id.fst";
+
+    // Not found and that's OK
+    if (!file_exists(instance_id_path)) {
+        return false;
+    }
+
+    // It has no newline inside
+    if (!read_file_to_string(instance_id_path, instance_id)) {
+        return false;
+    }
+
+    return true;
+}
 
 void send_usage_data_to_reporting_server() {
     extern std::string reporting_server;
     extern total_speed_counters_t total_counters_ipv4;
+    extern total_speed_counters_t total_counters_ipv6;
 
     // Build query
     std::stringstream request_stream;
@@ -3231,8 +3048,21 @@ void send_usage_data_to_reporting_server() {
     try {
         nlohmann::json stats;
 
-        stats["incoming_traffic_speed"] = total_counters_ipv4.total_speed_average_counters[INCOMING].bytes;
-        stats["outgoing_traffic_speed"] = total_counters_ipv4.total_speed_average_counters[OUTGOING].bytes;
+        uint64_t incoming_ipv4 = total_counters_ipv4.total_speed_average_counters[INCOMING].bytes;
+        uint64_t outgoing_ipv4 = total_counters_ipv4.total_speed_average_counters[OUTGOING].bytes;
+
+        uint64_t incoming_ipv6 = total_counters_ipv6.total_speed_average_counters[INCOMING].bytes;
+        uint64_t outgoing_ipv6 = total_counters_ipv6.total_speed_average_counters[OUTGOING].bytes;
+
+        stats["incoming_traffic_speed"] = incoming_ipv4 + incoming_ipv6;
+        stats["outgoing_traffic_speed"] = outgoing_ipv4 + outgoing_ipv6;
+
+        stats["incoming_traffic_speed_ipv4"] = incoming_ipv4;
+        stats["outgoing_traffic_speed_ipv4"] = outgoing_ipv4;
+
+        stats["incoming_traffic_speed_ipv6"] = incoming_ipv6;
+        stats["outgoing_traffic_speed_ipv6"] = outgoing_ipv6;
+
         stats["flows_speed"]            = netflow_ipfix_all_protocols_total_flows_speed;
         stats["headers_speed"]          = sflow_raw_packet_headers_total_speed;
         stats["total_hosts"]            = total_number_of_hosts_in_our_networks;
@@ -3312,6 +3142,14 @@ void send_usage_data_to_reporting_server() {
         }
 
         stats["linux_distro_version"] = linux_distro_version;
+
+        std::string instance_id;
+
+        if (get_instance_id(instance_id)) {
+            stats["instance_id"] = instance_id;
+        } else {
+            // OK, it's optional
+        }
 
         stats_json_string = stats.dump();
     } catch (...) {
@@ -3618,3 +3456,16 @@ void start_prometheus_web_server() {
         logger << log4cpp::Priority::ERROR << "Prometheus server exception: " << e.what();
     }
 }
+
+std::string get_human_readable_attack_detection_direction(attack_detection_direction_type_t attack_detection_direction) {
+    if (attack_detection_direction == attack_detection_direction_type_t::unknown) {
+        return "unknown";
+    } else if (attack_detection_direction == attack_detection_direction_type_t::incoming) {
+        return "incoming";
+    } else if (attack_detection_direction == attack_detection_direction_type_t::outgoing) {
+        return "outgoing";
+    } else {
+        return "unknown";
+    }
+}
+

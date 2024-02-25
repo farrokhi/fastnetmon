@@ -1,21 +1,32 @@
 #pragma once
 
-#include <functional>
 #include <mutex>
+#include <functional>
 
 #include "speed_counters.hpp"
+
+//
+// Even latest Debian Sid (March 2023) uses Boost 1.74 which does not behave well with very fresh compilers and triggers this error:
+// https://github.com/pavel-odintsov/fastnetmon/issues/970
+// This bug was fixed in fresh Boost versions: https://github.com/boostorg/serialization/issues/219 and we apply workaround only for 1.74
+//
+
+#include <boost/serialization/version.hpp>
+#if BOOST_VERSION / 100000 == 1 && BOOST_VERSION / 100 % 1000 == 74
+#include <boost/serialization/library_version_type.hpp>
+#endif
 
 #include <boost/serialization/unordered_map.hpp>
 
 // Class for abstract per key counters
-template <typename T, typename Counter> class abstract_subnet_counters_t {
+template <typename T, typename Counter, typename UM = std::unordered_map<T, Counter>> class abstract_subnet_counters_t {
     public:
-    std::unordered_map<T, Counter> counter_map;
+    UM counter_map;
     std::mutex counter_map_mutex;
 
-    std::unordered_map<T, Counter> average_speed_map;
+    UM average_speed_map;
 
-    // By using single map for speed and data we can accomplish imprevement from 3-4 seconds for 14m hosts to 2-3 seconds
+    // By using single map for speed and data we can accomplish improvement from 3-4 seconds for 14m hosts to 2-3 seconds
 
     template <class Archive> void serialize(Archive& ar, [[maybe_unused]] const unsigned int version) {
         ar& BOOST_SERIALIZATION_NVP(counter_map);
@@ -91,7 +102,7 @@ template <typename T, typename Counter> class abstract_subnet_counters_t {
     }
 
     // Retrieves all elements
-    void get_all_average_speed_elements(std::unordered_map<T, Counter>& copy_of_average_speed_map) {
+    void get_all_average_speed_elements(UM& copy_of_average_speed_map) {
         std::lock_guard<std::mutex> lock_guard(counter_map_mutex);
 
         copy_of_average_speed_map = this->average_speed_map;
@@ -188,7 +199,7 @@ template <typename T, typename Counter> class abstract_subnet_counters_t {
     }
 
     // Retrieves average speed for specified key with all locks
-    bool get_average_speed_subnet(const T& key, Counter& average_speed_element) {
+    bool get_average_speed(const T& key, Counter& average_speed_element) {
         std::lock_guard<std::mutex> lock_guard(this->counter_map_mutex);
 
         auto average_speed_itr = this->average_speed_map.find(key);

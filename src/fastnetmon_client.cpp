@@ -1,11 +1,18 @@
 #include <fstream>
 #include <iostream>
-#include <ncurses.h>
 #include <sstream>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string>
-#include <unistd.h>
+#include <thread>
+#include <chrono>
+
+#ifdef _WIN32
+// msys2 and mingw use nested path for some reasons but Linux keeps it in include directly: https://packages.msys2.org/package/mingw-w64-x86_64-ncurses
+// On Windows we do only static builds to avoid carrying bunch of dlls with us
+#define NCURSES_STATIC
+#include <ncurses/ncurses.h>
+#else
+#include <ncurses.h>
+#endif
 
 #include <boost/program_options.hpp>
 
@@ -56,7 +63,7 @@ int main(int argc, char** argv) {
     timeout(0);
 
     while (true) {
-        sleep(1);
+        std::this_thread::sleep_for (std::chrono::seconds(1));
 
         // clean up screen
         clear();
@@ -85,7 +92,13 @@ int main(int argc, char** argv) {
         reading_file.open(cli_stats_file_path.c_str(), std::ifstream::in);
 
         if (!reading_file.is_open()) {
-            std::cout << "Can't open fastnetmon stats file: " << cli_stats_file_path;
+            std::string error_message = "Can't open fastnetmon stats file: " + cli_stats_file_path;
+
+            addstr(error_message.c_str());
+
+            // update screen
+            refresh();
+            continue;
         }
 
         std::string line = "";

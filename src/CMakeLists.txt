@@ -1,7 +1,12 @@
-# It's version of cmake in our oldest supported distro CentOS 7: https://repology.org/project/cmake/versions
-cmake_minimum_required (VERSION 2.8.12)
+# We upgraded it to support https://cmake.org/cmake/help/latest/policy/CMP0077.html
+cmake_minimum_required (VERSION 3.13)
 
 set(FASTNETMON_LIBRARIES_GLOBAL_PATH "/opt/fastnetmon-community/libraries")
+
+# We need this options for generating compile_commands.json file
+# It's required for clang static analyzer and autocompletion tools based on clang
+# PVS uses it too
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(FastNetMon)
 
@@ -15,11 +20,11 @@ include(CheckLibraryExists)
 
 set (FASTNETMON_VERSION_MAJOR 1)
 set (FASTNETMON_VERSION_MINOR 2)
-set (FASTNETMON_VERSION_PATCH 5)
+set (FASTNETMON_VERSION_PATCH 7)
 
 set(HIREDIS_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/hiredis_0_14")
-set(LOG4CPP_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/log4cpp_1_1_3")
-# set(LIBPCAP_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/pcap_1.7.4")
+set(LOG4CPP_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/log4cpp_1_1_4")
+set(LIBPCAP_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/pcap_1_10_4")
 set(MONGO_C_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/mongo_c_driver_1_23_0")
 set(CAPNP_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/capnproto_0_8_0")
 set(OPENSSL_CUSTOM_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/openssl_1_1_1q")
@@ -34,11 +39,37 @@ set(LIB_CPP_KAFKA_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/cppkafka_0_3
 set(LIB_RDKAFKA_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/rdkafka_1_7_0")
 set(GTEST_INSTALL_PATH "${FASTNETMON_LIBRARIES_GLOBAL_PATH}/gtest_1_13_0")
 
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} --std=c++2a")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} --std=c++2a")
+# Enable time profiling for compilation phase
+# https://stackoverflow.com/questions/5962285/cmake-compilation-statistics-per-transation-unit
+# set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")
+
+# -Wunused includes more warnings than -Wall
+# In order to get a warning about an unused function parameter, you must either specify -Wextra -Wunused (note that -Wall implies -Wunused), or separately specify -Wunused-parameter.
+# TODO: return -Wunused-parameter and address all warning later, I started it but did not finish as we have too many of them
+# catch-value is documented here: https://patchwork.ozlabs.org/project/gcc/patch/tkrat.8c7b4260a533be2f@netcologne.de/#1680619
+add_definitions("-Wreorder -Wunused -Wparentheses -Wimplicit-fallthrough -Wreturn-type -Wuninitialized -Winit-self -Wmaybe-uninitialized -Wcatch-value=3 -Wclass-memaccess")
+
+# On Windows we need to build libgcc and libstdc++ statically to avoid need to carry dlls with us
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+  set(CMAKE_CXX_STANDARD_LIBRARIES "-static-libgcc -static-libstdc++ ${CMAKE_CXX_STANDARD_LIBRARIES}")
+endif()
+
+# We need this to avoid dependency on libwinpthread-1.dll
+# Details: https://cmake.org/pipermail/cmake/2019-June/069611.html
+if (MINGW)
+  set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-Bstatic,--whole-archive -lwinpthread -Wl,--no-whole-archive")
+endif()
+
+# We use this approach instead of following:
+# set (CMAKE_CXX_STANDARD 20)
+# Because it allows us to specify intermediate releases and releases not yet supported by cmake
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++20")
 
 # With this flag we can enable GoBGP build via console: cmake .. -DENABLE_GOBGP_SUPPORT=ON
 option(ENABLE_GOBGP_SUPPORT "Enable GoBGP support build" ON)
+
+# It can be disabled this way: cmake .. -DENABLE_PCAP_SUPPORT=OFF
+option(ENABLE_PCAP_SUPPORT "Enable PCAP support" ON)
 
 # On some platforms like Fedora we need to explicitly link with libabseil / libabsl.
 # We do not use it directly but gRPC uses it for libgpr and we need to link with absl explicitly to avoid linker errors like this:
@@ -107,11 +138,14 @@ if (DO_NOT_USE_SYSTEM_LIBRARIES_FOR_BUILD)
 
     SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${LIB_CPP_KAFKA_INSTALL_PATH}/lib")
     SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${LIB_RDKAFKA_INSTALL_PATH}/lib")
+
+    SET(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${LIBPCAP_CUSTOM_INSTALL_PATH}/lib")
 else()
    # We do not need any RPATH alterations when we want to link with system libraries (i.e. upstream builds for Debian or RedHat family)
 endif()
 
-message(STATUS "C++ compilation flags: ${CMAKE_CXX_FLAGS_RELEASE}")
+message(STATUS "C++ default compilation flags: ${CMAKE_CXX_FLAGS}")
+message(STATUS "C++ release compilation flags: ${CMAKE_CXX_FLAGS_RELEASE}")
 message(STATUS "C++ debug compilation flags: ${CMAKE_CXX_FLAGS_DEBUG}")
 
 set(FASTNETMON_PROFILER OFF)
@@ -147,6 +181,31 @@ execute_process(COMMAND git rev-list HEAD COMMAND head -n 1 COMMAND cut -c1-8 OU
 message(STATUS "Commit hash: ${GIT_LAST_COMMIT_HASH_SHORT}")
 
 set(FASTNETMON_APPLICATION_VERSION "${FASTNETMON_VERSION_MAJOR}.${FASTNETMON_VERSION_MINOR}.${FASTNETMON_VERSION_PATCH} ${GIT_LAST_COMMIT_HASH_SHORT}")
+
+# Set standard values which work for majority of platforms
+set(FASTNETMON_PID_PATH "/var/run/fastnetmon.pid")
+set(FASTNETMON_CONFIGURATION_PATH "/etc/fastnetmon.conf")
+set(FASTNETMON_LOG_FILE_PATH "/var/log/fastnetmon.log")
+set(FASTNETMON_ATTACK_DETAILS_FOLDER "/var/log/fastnetmon_attacks")
+set(FASTNETMON_NOTIFY_SCRIPT_PATH_DEFAULT "/usr/local/bin/notify_about_attack.sh")
+set(FASTNETMON_NETWORK_WHITELIST_PATH "/etc/networks_whitelist")
+set(FASTNETMON_NETWORKS_LIST_PATH "/etc/networks_list")
+set(FASTNETMON_BACKTRACE_PATH "/var/log/fastnetmon_backtrace.dump")
+
+# For FreeBSD based platforms we need to adjust them
+if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD" OR ${CMAKE_SYSTEM_NAME} STREQUAL "DragonFly")
+  set(FREEBSD_DEFAULT_PREFIX "/usr/local")
+
+  set(FASTNETMON_PID_PATH "/var/run/fastnetmon/fastnetmon.pid")
+  set(FASTNETMON_CONFIGURATION_PATH "${FREEBSD_DEFAULT_PREFIX}/etc/fastnetmon.conf")
+  set(FASTNETMON_LOG_FILE_PATH "/var/log/fastnetmon/fastnetmon.log")
+  set(FASTNETMON_ATTACK_DETAILS_FOLDER "/var/log/fastnetmon_attacks")
+  set(FASTNETMON_NOTIFY_SCRIPT_PATH_DEFAULT "${FREEBSD_DEFAULT_PREFIX}/bin/notify_about_attack.sh")
+  set(FASTNETMON_NETWORK_WHITELIST_PATH "${FREEBSD_DEFAULT_PREFIX}/etc/networks_whitelist")
+  set(FASTNETMON_NETWORKS_LIST_PATH "${FREEBSD_DEFAULT_PREFIX}/etc/networks_list")
+  set(FASTNETMON_BACKTRACE_PATH "/var/log/fastnetmon/fastnetmon_backtrace.dump")
+endif()
+
 configure_file(fast_platform.h.template "${PROJECT_SOURCE_DIR}/fast_platform.hpp")
 
 # Use new Memory Model Aware Atomic Operations
@@ -247,12 +306,19 @@ else()
     message(FATAL_ERROR "Can't find capnp compiler")
 endif()
 
+# We need to explicitly provide PATH for capnp to allow it to find capnpc-c++ 
+SET(CAPNP_ENVIRONMENT "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}" "PATH=$ENV{PATH}:${CAPNP_CUSTOM_INSTALL_PATH}/bin")
+
+# We cannot pass environment variables before tool call on Windows and we actually do need it
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+  SET(CAPNP_ENVIRONMENT "")
+endif()
 
 # Generate capnp bindings
 ADD_CUSTOM_COMMAND(
     OUTPUT ${PROJECT_SOURCE_DIR}/simple_packet_capnp/simple_packet.capnp.c++
     DEPENDS ${PROJECT_SOURCE_DIR}/simple_packet_capnp/simple_packet.capnp
-    COMMAND "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}" "PATH=$ENV{PATH}:${CAPNP_CUSTOM_INSTALL_PATH}/bin" ${CAPNP_BINARY} compile --output c++:${PROJECT_SOURCE_DIR}/simple_packet_capnp --src-prefix=${PROJECT_SOURCE_DIR}/simple_packet_capnp ${PROJECT_SOURCE_DIR}/simple_packet_capnp/simple_packet.capnp
+    COMMAND ${CAPNP_ENVIRONMENT} ${CAPNP_BINARY} compile --output c++:${PROJECT_SOURCE_DIR}/simple_packet_capnp --src-prefix=${PROJECT_SOURCE_DIR}/simple_packet_capnp ${PROJECT_SOURCE_DIR}/simple_packet_capnp/simple_packet.capnp
     COMMENT "Build Cap'n'Proto binding for C++"
 )
 
@@ -277,7 +343,7 @@ add_library(fastnetmon_pcap_format STATIC fastnetmon_pcap_format.cpp)
 add_library(fast_library STATIC fast_library.cpp)
 
 # Our ipfix database library
-add_library(ipfix_rfc STATIC ipfix_rfc.cpp)
+add_library(ipfix_rfc STATIC ipfix_fields/ipfix_rfc.cpp)
 
 add_library(bgp_protocol STATIC bgp_protocol.cpp)
 
@@ -342,6 +408,10 @@ else()
 endif()
 
 
+# We enable XDP plugin build for all platforms which support it
+# It can be disabled manually using flag: -DENABLE_AF_XDP_SUPPORT=FALSE
+option(ENABLE_AF_XDP_SUPPORT "Enables build for AF_XDP" ON)
+
 CHECK_CXX_SOURCE_COMPILES("
 #include <linux/if_xdp.h> 
 int main() {
@@ -349,12 +419,17 @@ int main() {
 }
 " HAVE_AF_XDP)
 
+# If XDP build enabled then we need to confirm that system has support for it
+if (${ENABLE_AF_XDP_SUPPORT})
 
-if (${HAVE_AF_XDP})
-    message(STATUS "Your system has support for AF_XDP")
-    set (ENABLE_AF_XDP_SUPPORT ON) 
-else()
-    message(STATUS "Your system does not support AF_XDP, disabled it")
+  if (${HAVE_AF_XDP})
+      message(STATUS "Your system has support for AF_XDP and we will build XDP plugin")
+  else()
+      # It may be old Linux, macOS, FreeBSD or Windows
+      message(STATUS "Your system does not support AF_XDP, disabling compilation of XDP plugin")
+      set (ENABLE_AF_XDP_SUPPORT FALSE)
+  endif()
+
 endif()
 
 
@@ -411,6 +486,19 @@ if (ENABLE_LIBBPF_SUPPORT)
 
 endif()
 
+### Look for libpcap
+
+find_path(LIBPCAP_INCLUDES_FOLDER NAMES pcap.h PATHS "${LIBPCAP_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+
+find_library(LIBPCAP_LIBRARY_PATH NAMES pcap PATHS "${LIBPCAP_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+
+if (LIBPCAP_INCLUDES_FOLDER AND LIBPCAP_LIBRARY_PATH)
+    message(STATUS "We found pcap library ${LIBPCAP_LIBRARY_PATH}")
+
+    include_directories(${LIBPCAP_INCLUDES_FOLDER})
+else()
+    message(FATAL_ERROR "We can't find pcap library")
+endif()
 
 
 if (ENABLE_AF_XDP_SUPPORT)
@@ -441,80 +529,142 @@ target_link_libraries(sflow_plugin simple_packet_parser_ng)
 # Link sFlow plugin with libsflow
 target_link_libraries(sflow_plugin libsflow)  
 
+# Netflow templates
+add_library(netflow_template STATIC netflow_plugin/netflow_template.cpp)
+
 # netflow library
 add_library(netflow STATIC netflow_plugin/netflow.cpp)
 
 # netflow plugin
 add_library(netflow_plugin STATIC netflow_plugin/netflow_collector.cpp)
-target_link_libraries(netflow_plugin ipfix_rfc netflow)
+target_link_libraries(netflow_plugin ipfix_rfc netflow netflow_template)
 
-# pcap plugin
-add_library(pcap_plugin STATIC pcap_plugin/pcap_collector.cpp)
-target_link_libraries(pcap_plugin pcap)
+if (ENABLE_PCAP_SUPPORT) 
+  # pcap plugin
+  add_library(pcap_plugin STATIC pcap_plugin/pcap_collector.cpp)
+  target_link_libraries(pcap_plugin ${LIBPCAP_LIBRARY_PATH})
+endif()
 
 find_package(Threads)
 
 add_library(exabgp_action STATIC actions/exabgp_action.cpp)
 
 if (LINK_WITH_ABSL)
-    find_package(absl REQUIRED)
+    find_package(absl REQUIRED ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
 
     # TODO: check that we actually found it. Otherwise trigger fatal erorr
 endif()
 
+if (ENABLE_PCAP_SUPPORT)
+    add_definitions(-DENABLE_PCAP)
+endif()
+
 if (ENABLE_GOBGP_SUPPORT)
     add_definitions(-DENABLE_GOBGP)
+
+    # GoBGP client library
+    add_library(gobgp_client STATIC gobgp_client/gobgp_client.cpp)
+
     add_library(gobgp_action STATIC actions/gobgp_action.cpp)
 
-    find_path(GRPC_INCLUDES_FOLDER NAMES grpc/grpc.h PATHS "${GRPC_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-    find_library(GRPC_LIBRARY_GRPC_PATH NAMES grpc PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-    find_library(GRPC_LIBRARY_GPR_PATH NAMES gpr PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-    find_library(GRPC_LIBRARY_GRPC_CPP_PATH NAMES grpc++ PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR}) 
+    # We use find_package for Windows as our approach for *nix platforms leads to bunch of linking errors
+    if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+      # Will be great to use this approach for all builds but it's relatively tricky to accomplish
+      # Debian 11 has no cmake files in official gRPC packages and only Debian Sid got them: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1006237
+      # gRPC bug tracker entry: https://github.com/grpc/grpc/issues/29977
+      # https://packages.debian.org/sid/amd64/libgrpc-dev/filelist
+      # Fedora has cmake files: https://packages.fedoraproject.org/pkgs/grpc/grpc-devel/fedora-38.html#files
+      # Epel 9 has cmake files: https://packages.fedoraproject.org/pkgs/grpc/grpc-devel/epel-9.html#files
+      # Both latest Ubuntu 22.04 and 22.10 does not offer it in official package: https://packages.ubuntu.com/kinetic/amd64/libgrpc-dev/filelist
+      # As Ubuntu and Debian our main platforms we will keep old logic for them until LTS / stable versions of Ubuntu and Debian receive it
+      # We need to offer smooth developer experience and allow options to build FastNetMon at least on these platforms without using custom compiled libraries 
+      find_package(gRPC CONFIG REQUIRED ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+    
+      if (gRPC_FOUND)
+        message(STATUS "Found gRPC")
+      else()
+        message(FATAL_ERROR "NOT Found gRPC module")
+      endif()
 
-    if (GRPC_INCLUDES_FOLDER AND GRPC_LIBRARY_GRPC_PATH AND GRPC_LIBRARY_GPR_PATH AND GRPC_LIBRARY_GRPC_CPP_PATH)
+        target_link_libraries(gobgp_client gRPC::grpc gRPC::grpc++)
+
+        target_link_libraries(gobgp_action gRPC::grpc gRPC::grpc++ gobgp_client)
+
+    else()
+
+      find_path(GRPC_INCLUDES_FOLDER NAMES grpc/grpc.h PATHS "${GRPC_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+      find_library(GRPC_LIBRARY_GRPC_PATH NAMES grpc PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+      find_library(GRPC_LIBRARY_GPR_PATH NAMES gpr PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+      find_library(GRPC_LIBRARY_GRPC_CPP_PATH NAMES grpc++ PATHS "${GRPC_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR}) 
+
+      if (GRPC_INCLUDES_FOLDER AND GRPC_LIBRARY_GRPC_PATH AND GRPC_LIBRARY_GPR_PATH AND GRPC_LIBRARY_GRPC_CPP_PATH)
         include_directories(${GRPC_INCLUDES_FOLDER})
         target_link_libraries(gobgp_action ${GRPC_LIBRARY_GRPC_PATH})
         target_link_libraries(gobgp_action ${GRPC_LIBRARY_GPR_PATH})
         target_link_libraries(gobgp_action ${GRPC_LIBRARY_GRPC_CPP_PATH})
-        
+        target_link_libraries(gobgp_action gobgp_client)
+
+        target_link_libraries(gobgp_client ${GRPC_LIBRARY_GRPC_PATH})
+        target_link_libraries(gobgp_client ${GRPC_LIBRARY_GPR_PATH})
+        target_link_libraries(gobgp_client ${GRPC_LIBRARY_GRPC_CPP_PATH})
+
 	    message(STATUS "Found gRPC library: ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH} ${GRPC_LIBRARY_GRPC_CPP_PATH}")
-    else()
+      else()
         message(FATAL_ERROR "Could not find gRPC library")
+      endif()
+
     endif()
 
     if (LINK_WITH_ABSL)
         target_link_libraries(gobgp_action absl::base absl::synchronization)
     endif()
 
-    find_path(PROTOCOL_BUFFERS_INCLUDE_FOLDER NAMES "google/protobuf/stubs/common.h" PATHS "${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-
-    find_library(PROTOCOL_BUFFERS_LIBRARY_PATH NAMES protobuf PATHS "${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR}) 
-
-    if (PROTOCOL_BUFFERS_INCLUDE_FOLDER AND PROTOCOL_BUFFERS_LIBRARY_PATH)
-        include_directories(${PROTOCOL_BUFFERS_INCLUDE_FOLDER}) 
-        target_link_libraries(gobgp_action ${PROTOCOL_BUFFERS_LIBRARY_PATH}) 
-	    message(STATUS "Found protobuf library: ${PROTOCOL_BUFFERS_LIBRARY_PATH}")
-    else()
-        message(FATAL_ERROR "Could not find protocol buffers")
+    if (DO_NOT_USE_SYSTEM_LIBRARIES_FOR_BUILD)
+      # We add our custom path to Protobuf to top of search_list used by find_package: https://cmake.org/cmake/help/latest/variable/CMAKE_PREFIX_PATH.html
+      # This approach has advantage over Protobuf_DIR which requires us to set direct path to cmake folder of custom built dependency
+      # which resides in vendor specific folder with name lib which may be lib64 on CentOS platforms:
+      # protobuf_21_12/lib/cmake/protobuf or  protobuf_21_12/lib64/cmake/protobuf on CentOS 
+      list(APPEND CMAKE_PREFIX_PATH ${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}) 
     endif()
 
+    # Apparently it's required to set this flag because without this flag set it cannot find protoc when custom library path is in use
+    # https://github.com/protocolbuffers/protobuf/issues/1931
+    set(protobuf_MODULE_COMPATIBLE true)
 
-    # message(STATUS "grpc: ${GRPC_INCLUDES_FOLDER} ${GRPC_LIBRARY_GRPC_PATH} ${GRPC_LIBRARY_GPR_PATH}")
-    # message(STATUS ${PROJECT_BINARY_DIR})
+    # Switch to use to configuration supplied by custom Protobuf installation as it may be better
+    find_package(Protobuf CONFIG)
 
-    find_program(PROTOC_BINARY protoc PATHS "${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/bin" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-
-    if (PROTOC_BINARY)
-        message(STATUS "Found protoc protobuf compiler: ${PROTOC_BINARY}")
-
-        # We need to explicitly provide paths for our dependency libraries in environment variable LD_LIBRARY_PATH as we use non system path for them
-        # CentOS uses lib64 but Debian / Ubuntu still use lib for Protobuf, that's why we keep both of them
-        set(ENV{LD_LIBRARY_PATH} "${GCC_INSTALL_PATH}/lib64:${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/lib:${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/lib64:${GRPC_CUSTOM_INSTALL_PATH}/lib")
-    else()
-        message(FATAL_ERROR "Can't find protoc compiler")
+    if (NOT Protobuf_FOUND)
+      # Fall back to module supplied by cmake to search for Protobuf
+      # https://cmake.org/cmake/help/latest/module/FindProtobuf.html
+      find_package(Protobuf MODULE REQUIRED)
     endif()
 
-    # Search for gRPC plugin for protobuf, it's just binary
+    if (Protobuf_FOUND)
+      message(STATUS "Found Protobuf ${Protobuf_VERSION}")
+
+      # Empty checks are very tricky in cmake:
+      # https://cmake.org/pipermail/cmake/2011-October/046939.html
+      if ("${Protobuf_PROTOC_EXECUTABLE}" STREQUAL "")
+        message(FATAL_ERROR "Protobuf was found but we did not find protoc")
+      endif()
+
+      message(STATUS "Found Protobuf compiler: '${Protobuf_PROTOC_EXECUTABLE}'")
+
+      # We need to explicitly provide paths for our dependency libraries in environment variable LD_LIBRARY_PATH as we use non system path for them
+      # CentOS uses lib64 but Debian / Ubuntu still use lib for Protobuf, that's why we keep both of them
+      set(ENV{LD_LIBRARY_PATH} "${GCC_INSTALL_PATH}/lib64:${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/lib:${PROTOCOL_BUFFERS_CUSTOM_INSTALL_PATH}/lib64:${GRPC_CUSTOM_INSTALL_PATH}/lib")
+
+      message(STATUS "Protobuf include directory: ${Protobuf_INCLUDE_DIRS}") 
+
+      include_directories(${Protobuf_INCLUDE_DIRS})
+    else()
+      message(FATAL_ERROR "NOT Found Protobuf module")
+    endif()
+
+    target_link_libraries(gobgp_action protobuf::libprotobuf)
+
+    # Search for gRPC plugin for Protobuf, it's just binary
     find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin PATHS "${GRPC_CUSTOM_INSTALL_PATH}/bin" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
 
     if (GRPC_CPP_PLUGIN) 
@@ -525,17 +675,17 @@ if (ENABLE_GOBGP_SUPPORT)
 
     message(STATUS "Building protobuf and gRPC mappings for C++")
 
-    execute_process(COMMAND ${PROTOC_BINARY} -I ${PROJECT_SOURCE_DIR}/actions --grpc_out=${PROJECT_SOURCE_DIR}/actions --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${PROJECT_SOURCE_DIR}/actions/gobgp.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/gobgp_client --grpc_out=${PROJECT_SOURCE_DIR}/gobgp_client --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${PROJECT_SOURCE_DIR}/gobgp_client/gobgp.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     message(STATUS "Protoc return code for gobgp.proto gRPC: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
 
-    execute_process(COMMAND ${PROTOC_BINARY} -I  ${PROJECT_SOURCE_DIR}/actions --cpp_out=${PROJECT_SOURCE_DIR}/actions ${PROJECT_SOURCE_DIR}/actions/gobgp.proto ${PROJECT_SOURCE_DIR}/actions/attribute.proto  ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I  ${PROJECT_SOURCE_DIR}/gobgp_client --cpp_out=${PROJECT_SOURCE_DIR}/gobgp_client ${PROJECT_SOURCE_DIR}/gobgp_client/gobgp.proto ${PROJECT_SOURCE_DIR}/gobgp_client/attribute.proto  ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     message(STATUS "Protoc return code for gobgp.proto and attribute.proto Protobuf: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
 
     message(STATUS "Building Protobuf bindings for C++ for Flow Data")
 
-    execute_process(COMMAND ${PROTOC_BINARY} -I ${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf --cpp_out=${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf ${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf/traffic_data.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf --cpp_out=${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf ${PROJECT_SOURCE_DIR}/traffic_output_formats/protobuf/traffic_data.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     message(STATUS "Protoc return code for FlowData Protobuf: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
     
@@ -546,24 +696,32 @@ if (ENABLE_GOBGP_SUPPORT)
     target_link_libraries(protobuf_traffic_format traffic_data_library)
 
     # Build gRPC and protocol buffers libraries and link they to gobgp_action
-    add_library(gobgp_api_client_pb_cc STATIC actions/gobgp.pb.cc)
-    add_library(gobgp_api_client_grpc_pb_cc STATIC actions/gobgp.grpc.pb.cc)
+    add_library(gobgp_api_client_pb_cc STATIC gobgp_client/gobgp.pb.cc)
+    add_library(gobgp_api_client_grpc_pb_cc STATIC gobgp_client/gobgp.grpc.pb.cc)
+
+    # It does not work without on Windows but works fine on *nix
+    if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+      target_link_libraries(gobgp_api_client_grpc_pb_cc gRPC::grpc gRPC::grpc++)
+    endif()
 
     target_link_libraries(gobgp_action gobgp_api_client_pb_cc)
     target_link_libraries(gobgp_action gobgp_api_client_grpc_pb_cc)
 
     # Add attributes
-    add_library(attribute_pb_cc STATIC actions/attribute.pb.cc)
+    add_library(attribute_pb_cc STATIC gobgp_client/attribute.pb.cc)
+
+    target_link_libraries(attribute_pb_cc protobuf::libprotobuf)
+
     target_link_libraries(gobgp_action attribute_pb_cc)
 
     # FastNetMon API
     add_definitions(-DFASTNETMON_API)    
 
-    execute_process(COMMAND ${PROTOC_BINARY} -I ${PROJECT_SOURCE_DIR} --grpc_out=${PROJECT_SOURCE_DIR} --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${PROJECT_SOURCE_DIR}/fastnetmon.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR} --grpc_out=${PROJECT_SOURCE_DIR} --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN} ${PROJECT_SOURCE_DIR}/fastnetmon.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE)
 
     message(STATUS "Protoc return code for gRPC fastnetmon.proto: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
 
-    execute_process(COMMAND ${PROTOC_BINARY} -I ${PROJECT_SOURCE_DIR} --cpp_out=${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/fastnetmon.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE) 
+    execute_process(COMMAND ${Protobuf_PROTOC_EXECUTABLE} -I ${PROJECT_SOURCE_DIR} --cpp_out=${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/fastnetmon.proto ERROR_VARIABLE PROTOC_STDERR RESULT_VARIABLE PROTOC_RETURN_CODE OUTPUT_STRIP_TRAILING_WHITESPACE) 
 
     message(STATUS "Protoc return code for protobuf fastnetmon.proto: ${PROTOC_RETURN_CODE} std err: ${PROTOC_STDERR}")
 
@@ -576,23 +734,37 @@ if (ENABLE_GOBGP_SUPPORT)
         target_link_libraries(fastnetmon_api_client  absl::base absl::synchronization)
     endif()
 
-    target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GPR_PATH})
-    target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GRPC_CPP_PATH})
-    target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GRPC_PATH})
+    # We use another way to specify dependencies for Windows as our standard approach clearly does not work
+    # https://www.f-ax.de/dev/2020/11/08/grpc-plugin-cmake-support.html
+    if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+      target_link_libraries(fastnetmon_api_client gRPC::grpc gRPC::grpc++)
+    else()
+      target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GPR_PATH})
+      target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GRPC_CPP_PATH})
+      target_link_libraries(fastnetmon_api_client ${GRPC_LIBRARY_GRPC_PATH})
+    endif()
+
     target_link_libraries(fastnetmon_api_client fastnetmon_grpc_pb_cc)
     target_link_libraries(fastnetmon_api_client fastnetmon_pb_cc)
-    target_link_libraries(fastnetmon_api_client ${PROTOCOL_BUFFERS_LIBRARY_PATH}) 
+
+    target_link_libraries(fastnetmon_api_client protobuf::libprotobuf)
 
     if (KAFKA_SUPPORT)
         target_link_libraries(fastnetmon ${LIBKAFKA_CPP_LIBRARY_PATH})
     endif()
 
-    target_link_libraries(fastnetmon ${GRPC_LIBRARY_GPR_PATH})
-    target_link_libraries(fastnetmon ${GRPC_LIBRARY_GRPC_CPP_PATH})
-    target_link_libraries(fastnetmon ${GRPC_LIBRARY_GRPC_PATH})
+    if (${CMAKE_SYSTEM_NAME} STREQUAL "Windows")
+      target_link_libraries(fastnetmon gRPC::grpc gRPC::grpc++)
+    else()
+      target_link_libraries(fastnetmon ${GRPC_LIBRARY_GPR_PATH})
+      target_link_libraries(fastnetmon ${GRPC_LIBRARY_GRPC_CPP_PATH})
+      target_link_libraries(fastnetmon ${GRPC_LIBRARY_GRPC_PATH})
+    endif()
+
     target_link_libraries(fastnetmon fastnetmon_grpc_pb_cc)
     target_link_libraries(fastnetmon fastnetmon_pb_cc)
-    target_link_libraries(fastnetmon ${PROTOCOL_BUFFERS_LIBRARY_PATH}) 
+
+    target_link_libraries(fastnetmon protobuf::libprotobuf)
 endif()
 
 # example plugin
@@ -617,7 +789,7 @@ set(Boost_DETAILED_FAILURE_MSG ON)
 # Boost.System is a library that, in essence, defines four classes to identify errors. All four classes were added to the standard library with C++11. If your development environment supports C++11, you don’t need to use Boost.System. However, since many Boost libraries use Boost.System, you might encounter Boost.System through those other libraries.
 # Boost.System is a library that, in essence, defines four classes to identify errors. All four classes were added to the standard library with C++11. If your development environment supports C++11, you don’t need to use Boost.System. However, since many Boost libraries use Boost.System, you might encounter Boost.System through those other libraries.
 # TODO: we may not need system at all
-find_package(Boost COMPONENTS serialization thread regex program_options system REQUIRED)
+find_package(Boost COMPONENTS serialization thread regex program_options system REQUIRED ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
 
 if(Boost_FOUND)
     message(STATUS "Found Boost: ${Boost_LIBRARIES} ${Boost_INCLUDE_DIRS}")
@@ -637,9 +809,14 @@ target_link_libraries(fast_library fastnetmon_pcap_format)
 # Try to find ncurses library
 find_package(Curses REQUIRED)
 
-if(CURSES_FOUND) 
+if(CURSES_FOUND)
+    message(STATUS "Found curses library: ${CURSES_LIBRARIES}")
+    message(STATUS "Found curses includes: ${CURSES_INCLUDE_DIRS}")
+
     include_directories(${CURSES_INCLUDE_DIRS})
     target_link_libraries(fastnetmon_client ${CURSES_LIBRARIES})
+else()
+    message(STATUS "We did not find curses library")
 endif()
 
 ### Move this code to cmake module
@@ -706,41 +883,34 @@ if (ENABLE_CAPNP_SUPPORT)
 endif()
 
 
-### Find mongo-c
-find_path(MONGOC_INCLUDES_FOLDER NAMES libmongoc-1.0/mongoc.h PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-find_library(MONGOC_LIBRARY_PATH NAMES mongoc-1.0 PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+# With this flag we can control MongoDB build via console: cmake .. -DENABLE_MONGODB_SUPPORT=ON
+option(ENABLE_MONGODB_SUPPORT "Enable MongoDB support build" ON)
 
-### find bson
-find_path(BSON_INCLUDES_FOLDER NAMES libbson-1.0/bson.h PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-find_library(BSON_LIBRARY_PATH NAMES bson-1.0 PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+if (ENABLE_MONGODB_SUPPORT) 
 
-if (MONGOC_INCLUDES_FOLDER AND MONGOC_LIBRARY_PATH AND BSON_INCLUDES_FOLDER AND BSON_LIBRARY_PATH)
-    message(STATUS "We found mongo-c library ${MONGOC_INCLUDES_FOLDER} ${MONGOC_LIBRARY_PATH} ${BSON_INCLUDES_FOLDER} ${BSON_LIBRARY_PATH}")
-    add_definitions(-DMONGO)
+    ### Find mongo-c
+    find_path(MONGOC_INCLUDES_FOLDER NAMES libmongoc-1.0/mongoc.h PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+    find_library(MONGOC_LIBRARY_PATH NAMES mongoc-1.0 PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
 
-    # We add suffix name because cmake could not detect it correctly...
-    include_directories("${MONGOC_INCLUDES_FOLDER}/libmongoc-1.0")
-    include_directories("${BSON_INCLUDES_FOLDER}/libbson-1.0")
+    ### find bson
+    find_path(BSON_INCLUDES_FOLDER NAMES libbson-1.0/bson.h PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
+    find_library(BSON_LIBRARY_PATH NAMES bson-1.0 PATHS "${MONGO_C_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
 
-    target_link_libraries(fastnetmon ${MONGOC_LIBRARY_PATH} ${BSON_LIBRARY_PATH})
-    target_link_libraries(fastnetmon_logic ${MONGOC_LIBRARY_PATH} ${BSON_LIBRARY_PATH})
-else()
-    message(FATAL_ERROR "We can't find Mongo C library")
+    if (MONGOC_INCLUDES_FOLDER AND MONGOC_LIBRARY_PATH AND BSON_INCLUDES_FOLDER AND BSON_LIBRARY_PATH)
+        message(STATUS "We found mongo-c library ${MONGOC_INCLUDES_FOLDER} ${MONGOC_LIBRARY_PATH} ${BSON_INCLUDES_FOLDER} ${BSON_LIBRARY_PATH}")
+        add_definitions(-DMONGO)
+
+        # We add suffix name because cmake could not detect it correctly...
+        include_directories("${MONGOC_INCLUDES_FOLDER}/libmongoc-1.0")
+        include_directories("${BSON_INCLUDES_FOLDER}/libbson-1.0")
+
+        target_link_libraries(fastnetmon ${MONGOC_LIBRARY_PATH} ${BSON_LIBRARY_PATH})
+        target_link_libraries(fastnetmon_logic ${MONGOC_LIBRARY_PATH} ${BSON_LIBRARY_PATH})
+    else()
+        message(FATAL_ERROR "We can't find Mongo C library")
+    endif()
+
 endif()
-
-### Look for libpcap
-
-#find_path(LIBPCAP_INCLUDES_FOLDER NAMES pcap.h PATHS "${LIBPCAP_CUSTOM_INSTALL_PATH}/include" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-
-#find_library(LIBPCAP_LIBRARY_PATH NAMES pcap PATHS "${LIBPCAP_CUSTOM_INSTALL_PATH}/lib" ${DISABLE_DEFAULT_PATH_SEARCH_VAR})
-
-#if (LIBPCAP_INCLUDES_FOLDER AND LIBPCAP_LIBRARY_PATH) 
-#    message(STATUS "We found pcap library ${LIBPCAP_LIBRARY_PATH}")
-
-#    include_directories(${LIBPCAP_INCLUDES_FOLDER})
-#else()
-#    message(FATAL_ERROR "We can't find pcap library")    
-#endif()
 
 ### Look for log4cpp
 
@@ -801,7 +971,11 @@ if (ENABLE_AF_XDP_SUPPORT)
     target_link_libraries(fastnetmon xdp_plugin)
 endif()
 
-target_link_libraries(fastnetmon sflow_plugin netflow_plugin pcap_plugin example_plugin)
+target_link_libraries(fastnetmon sflow_plugin netflow_plugin example_plugin)
+
+if (ENABLE_PCAP_SUPPORT)
+target_link_libraries(fastnetmon pcap_plugin)
+endif()
 
 target_link_libraries(fastnetmon fastnetmon_logic)
 

@@ -1,8 +1,16 @@
 #pragma once
 
 #include <cstring>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <in6addr.h>    // in6_addr
+#else
+
 #include <netinet/in.h>
 #include <sys/socket.h>
+
+#endif
 
 #include <boost/functional/hash.hpp>
 
@@ -11,27 +19,22 @@
 // IPv6 subnet with mask in cidr form
 class subnet_ipv6_cidr_mask_t {
     public:
-    subnet_ipv6_cidr_mask_t() {
-        // Fill subnet by zeros
-        memset(&this->subnet_address, 0, sizeof(in6_addr));
-    }
-
     void set_cidr_prefix_length(uint32_t cidr_prefix_length) {
         this->cidr_prefix_length = cidr_prefix_length;
     }
 
     // Just copy this data by pointer
-    void set_subnet_address(in6_addr* ipv6_host_address_param) {
+    void set_subnet_address(const in6_addr* ipv6_host_address_param) {
         memcpy(&subnet_address, ipv6_host_address_param, sizeof(in6_addr));
     }
 
-    template <class Archive> void serialize(Archive& ar, const unsigned int version) {
-        // Boost does not know how to serialize in6_addr but nested s6_addr is a just array with 16 elements of char and we do serialzie it instead
+    template <class Archive> void serialize(Archive& ar, [[maybe_unused]] const unsigned int version) {
+        // Boost does not know how to serialize in6_addr but nested s6_addr is a just array with 16 elements of char and we do serialize it instead
         ar& BOOST_SERIALIZATION_NVP(subnet_address.s6_addr);
         ar& BOOST_SERIALIZATION_NVP(cidr_prefix_length);
     }
 
-    in6_addr subnet_address;
+    in6_addr subnet_address{};
     uint32_t cidr_prefix_length = 128;
 };
 
@@ -43,7 +46,7 @@ inline bool operator<(const subnet_ipv6_cidr_mask_t& lhs, const subnet_ipv6_cidr
         return true;
     } else if (lhs.cidr_prefix_length == rhs.cidr_prefix_length) {
         // Compare addresses as memory blocks
-        // Order may be incorrect (desc vs asc)
+        // Order may be incorrect (descending vs ascending)
         return memcmp(&lhs.subnet_address, &rhs.subnet_address, sizeof(in6_addr)) < 0;
     } else {
         return false;
@@ -55,7 +58,7 @@ inline bool operator<(const subnet_ipv6_cidr_mask_t& lhs, const subnet_ipv6_cidr
 namespace std {
 template <> struct hash<subnet_ipv6_cidr_mask_t> {
     typedef std::size_t result_type;
-    std::size_t operator()(subnet_ipv6_cidr_mask_t const& s) const {
+    std::size_t operator()(const subnet_ipv6_cidr_mask_t& s) const {
         std::size_t seed = 0;
 
         const uint8_t* b = s.subnet_address.s6_addr;
@@ -82,6 +85,15 @@ inline bool operator==(const subnet_ipv6_cidr_mask_t& lhs, const subnet_ipv6_cid
 }
 
 inline bool operator!=(const subnet_ipv6_cidr_mask_t& lhs, const subnet_ipv6_cidr_mask_t& rhs) {
+    return !(lhs == rhs);
+}
+
+// Compares for standard IPv6 structure
+inline bool operator==(const in6_addr& lhs, const in6_addr& rhs) {
+    return memcmp(&lhs, &rhs, sizeof(in6_addr)) == 0;
+}
+
+inline bool operator!=(const in6_addr& lhs, const in6_addr& rhs) {
     return !(lhs == rhs);
 }
 
@@ -125,7 +137,7 @@ class subnet_cidr_mask_t {
         this->cidr_prefix_length = cidr_prefix_length;
     }
 
-    template <class Archive> void serialize(Archive& ar, const unsigned int version) {
+    template <class Archive> void serialize(Archive& ar, [[maybe_unused]] const unsigned int version) {
         ar& BOOST_SERIALIZATION_NVP(subnet_address);
         ar& BOOST_SERIALIZATION_NVP(cidr_prefix_length);
     }
@@ -137,7 +149,6 @@ class subnet_cidr_mask_t {
     uint32_t cidr_prefix_length = 0;
 };
 
-// TODO: move to .cpp file!!!
 inline bool operator==(const subnet_cidr_mask_t& lhs, const subnet_cidr_mask_t& rhs) {
     // Prefixes has different lengths
     if (lhs.cidr_prefix_length != rhs.cidr_prefix_length) {
@@ -151,8 +162,7 @@ inline bool operator!=(const subnet_cidr_mask_t& lhs, const subnet_cidr_mask_t& 
     return !(lhs == rhs);
 }
 
-// TODO: move to .cpp file!!!
-// We need free function for comparision code
+// We need free function for comparison code
 inline bool operator<(const subnet_cidr_mask_t& lhs, const subnet_cidr_mask_t& rhs) {
     if (lhs.cidr_prefix_length < rhs.cidr_prefix_length) {
         return true;
@@ -163,28 +173,13 @@ inline bool operator<(const subnet_cidr_mask_t& lhs, const subnet_cidr_mask_t& r
     }
 }
 
-// Subnet with binary mask
-class subnet_binary_netmask_t {
-    public:
-    subnet_binary_netmask_t() {
-        this->subnet_address     = 0;
-        this->subnet_binary_mask = 0;
-    }
-    subnet_binary_netmask_t(uint32_t subnet_address, uint32_t subnet_binary_mask) {
-        this->subnet_address     = subnet_address;
-        this->subnet_binary_mask = subnet_binary_mask;
-    }
-    uint32_t subnet_address     = 0;
-    uint32_t subnet_binary_mask = 0;
-};
-
 namespace std {
 
 // Inject custom specialization of std::hash in namespace std
 // We need it for std::unordered_map
 template <> struct hash<subnet_cidr_mask_t> {
     typedef std::size_t result_type;
-    std::size_t operator()(subnet_cidr_mask_t const& s) const {
+    std::size_t operator()(const subnet_cidr_mask_t& s) const {
         std::size_t seed = 0;
 
         boost::hash_combine(seed, s.cidr_prefix_length);
@@ -195,3 +190,12 @@ template <> struct hash<subnet_cidr_mask_t> {
 };
 
 } // namespace std
+
+// This class can keep any network
+class subnet_ipv4_ipv6_cidr_t {
+    public:
+    subnet_cidr_mask_t ipv4{};
+    subnet_ipv6_cidr_mask_t ipv6{};
+
+    bool is_ipv6 = false;
+};

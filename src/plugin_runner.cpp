@@ -14,7 +14,11 @@
 #include "fastnetmon_types.h"
 #include "libpatricia/patricia.hpp"
 #include "netflow_plugin/netflow_collector.h"
+
+#ifdef ENABLE_PCAP
 #include "pcap_plugin/pcap_collector.h"
+#endif
+
 #include "sflow_plugin/sflow_collector.h"
 
 #ifdef FASTNETMON_ENABLE_AFPACKET
@@ -62,7 +66,7 @@ void init_logging() {
 
     logger.setPriority(log4cpp::Priority::INFO);
     logger.addAppender(appender);
-    logger.info("Logger initialized!");
+    logger.info("Logger initialized");
 }
 
 void process_packet(simple_packet& current_packet) {
